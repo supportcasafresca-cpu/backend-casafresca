@@ -160,7 +160,7 @@ app.get(/^\/p\/(.*)/, async (req, res) => {
         <html lang="es">
         <head>
             <meta charset="UTF-8">
-            <meta property="og:title" content="Producto no encontrado - Buquenqe" />
+            <meta property="og:title" content="Producto no encontrado - Casa Fresca" />
 
             <link rel="icon" href="https://casa-fresca.onrender.com/Img/favicon.ico" type="image/x-icon" />
             <link rel="shortcut icon" href="https://casa-fresca.onrender.com/Img/favicon.ico" />
@@ -186,7 +186,7 @@ app.get(/^\/p\/(.*)/, async (req, res) => {
 
         // Datos para Meta Tags
         const nombre = product.nombre || "Producto";
-        const descripcion = product.descripcion || "Disponible en Buquenqe";
+        const descripcion = product.descripcion || "Disponible en Casa Fresca";
         const imagen = (product.imagenes && product.imagenes.length) 
             ? `https://raw.githubusercontent.com/supportcasafresca-cpu/Casa-Fresca/refs/heads/main/Img/products/${encodeURIComponent(product.imagenes[0])}`
             : "https://casa-fresca.onrender.com/Img/social-share-banner.jpg";
@@ -203,7 +203,7 @@ app.get(/^\/p\/(.*)/, async (req, res) => {
             <link rel="icon" href="https://casa-fresca.onrender.com/Img/favicon.ico" type="image/x-icon" />
             <link rel="shortcut icon" href="https://casa-fresca.onrender.com/Img/favicon.ico" />
 
-            <meta property="og:site_name" content="Buquenque Shop" />
+            <meta property="og:site_name" content="Casa Fresca" />
 
             <meta property="og:title" content="${_escapeHtml(nombre)}" />
             <meta property="og:description" content="${_escapeHtml(descripcion)}" />
