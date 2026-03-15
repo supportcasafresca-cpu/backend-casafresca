@@ -347,7 +347,7 @@ app.get("/obtener-estadisticas", async (req, res) => {
 
 // ** IMPORTANTE: REEMPLAZA ESTA URL CON LA URL DE TU APLICACIÓN WEB DE APPS SCRIPT **
 // Esta es la URL que obtuviste al publicar tu script de Google Apps Script como Web App.
-const GOOGLE_APPS_SCRIPT_SHEETS_URL = "https://script.google.com/macros/s/AKfycbzcX8GDu-6sMegdKKAn5DgLMp9E8BzcM6C3j6WttFiAwiU1RhA42eDzAxIgql-Eat2xhA/exec";
+const GOOGLE_APPS_SCRIPT_SHEETS_URL = ""; //"https://script.google.com/macros/s/AKfycbzcX8GDu-6sMegdKKAn5DgLMp9E8BzcM6C3j6WttFiAwiU1RhA42eDzAxIgql-Eat2xhA/exec";
 
 const GOOGLE_APPS_SCRIPT_CORREO_URL = "https://script.google.com/macros/s/AKfycby-g_Dtzo4eHPvChIO3Xr-fNGzVgAqhimHsW5zci3CcpwjMUze91kugN51KhNstVpot/exec";
 
@@ -371,18 +371,18 @@ app.post('/send-pedido', async (req, res) => {
         });
 
         // 2. Enviar los datos al segundo script (Sheets)
-        console.log('Enviando datos a Google Apps Script (Sheets)...');
+        /*console.log('Enviando datos a Google Apps Script (Sheets)...');
         const responseSheets = await fetch(GOOGLE_APPS_SCRIPT_SHEETS_URL,{
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(orderData),
-        });
+        });*/
 
         // 3. Procesar las respuestas de texto a JSON de forma segura
         const textResponse1 = await response.text();
-        const textResponse2 = await responseSheets.text();
+        //const textResponse2 = await responseSheets.text();
         
-        let gasResponse, gasResponseSheets;
+        //let gasResponse, gasResponseSheets;
 
         // Parseo seguro respuesta 1
         try {
@@ -393,14 +393,14 @@ app.post('/send-pedido', async (req, res) => {
         }
 
         // Parseo seguro respuesta 2
-        try {
+        /*try {
             gasResponseSheets = JSON.parse(textResponse2);
         } catch (e) {
             console.warn('Respuesta 2 no es JSON válido:', textResponse2);
             gasResponseSheets = { status: "error", message: "Respuesta no válida del script sheets", raw: textResponse2 };
-        }
+        }*/
 
-        console.log('Respuestas recibidas de Google. Actualizando local...');
+        //console.log('Respuestas recibidas de Google. Actualizando local...');
 
         // 4. Ejecutar la función local para actualizar la comparación
         try {
@@ -413,15 +413,15 @@ app.post('/send-pedido', async (req, res) => {
 
         // 5. EVALUACIÓN FINAL Y ENVÍO DE UNA ÚNICA RESPUESTA
         const mainSuccess = response.ok && gasResponse.status === "success";
-        const sheetsSuccess = responseSheets.ok && gasResponseSheets.status === "success";
+        //const sheetsSuccess = responseSheets.ok && gasResponseSheets.status === "success";
 
-        if (mainSuccess && sheetsSuccess) {
+        if (mainSuccess /*&& sheetsSuccess*/) {
             // Caso ideal: Ambos funcionaron
             return res.status(200).json({
                 success: true,
                 message: 'Pedido enviado correctamente a ambos sistemas.',
                 gasResponse: gasResponse,
-                gasResponseSheets: gasResponseSheets
+                //gasResponseSheets: gasResponseSheets
             });
         } else {
             // Caso de error: Al menos uno falló
@@ -431,7 +431,7 @@ app.post('/send-pedido', async (req, res) => {
                 message: 'El pedido se procesó parcialmente o hubo un error en los servicios de Google.',
                 details: {
                     principal: { success: mainSuccess, response: gasResponse },
-                    sheets: { success: sheetsSuccess, response: gasResponseSheets }
+                    //sheets: { success: sheetsSuccess, response: gasResponseSheets }
                 }
             });
         }
@@ -451,6 +451,7 @@ app.post('/send-pedido', async (req, res) => {
 });
 
 
+/*
 app.post('/delete-order', async (req, res) => {
     const { rows } = req.body;
 
@@ -544,7 +545,7 @@ app.get('/api/pedidos-sheets', async (req, res) => {
     }
 });
 
-
+*/
 
 // Nueva ruta API para obtener el estado del servidor
 app.get("/api/server-status", async (req, res) => {
