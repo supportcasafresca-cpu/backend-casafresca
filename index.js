@@ -43,22 +43,27 @@ const allowedOrigins = [
     "https://analytics-casafresca.onrender.com",
     "http://127.0.0.1:5500",
     "http://localhost:10000",
-    'http://localhost:8100',    // Ionic local
-    'http://localhost',         // pruebas
-    'capacitor://localhost',
+    'https://localhost',                      // Capacitor Android
+    'capacitor://localhost',                  // Capacitor iOS
+    'http://localhost',                       // Pruebas en navegador
+    'http://localhost:8100',                   // Ionic Dev Server
     "http://localhost:5500"
 ];
 
 app.use(cors({
     origin: function (origin, callback) {
-        if (!origin || allowedOrigins.includes(origin)) {
-            callback(null, true);
-        } else {
-            callback(new Error("No permitido por CORS"));
+        // Permitir peticiones sin origen (como aplicaciones móviles o curl)
+        if (!origin) return callback(null, true);
+        
+        if (allowedOrigins.indexOf(origin) === -1) {
+            const msg = 'El policy de CORS para este sitio no permite acceso desde el origen especificado.';
+            return callback(new Error(msg), false);
         }
+        return callback(null, true);
     },
-    methods: ["GET", "POST", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type"]
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-New-Orders'], // Importante incluir tus headers personalizados
+    credentials: true
 }));
 
 // Middleware para procesar JSON
