@@ -43,6 +43,7 @@ const allowedOrigins = [
     "https://analytics-casafresca.onrender.com",
     "http://127.0.0.1:5500",
     "http://localhost:10000",
+    'capacitor://localhost',
     "http://localhost:5500"
 ];
 
