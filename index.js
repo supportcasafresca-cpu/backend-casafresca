@@ -149,7 +149,8 @@ app.get(/^\/p\/(.*)/, async (req, res) => {
     const PRODUCTS_URL = "https://raw.githubusercontent.com/supportcasafresca-cpu/Casa-Fresca/refs/heads/main/Json/products.json";
 
     try {
-        const response = await fetch(PRODUCTS_URL);
+        const response = await fetch(`${PRODUCTS_URL}?v=${Date.now()}`);
+
         if (!response.ok) throw new Error(`Fetch fallido: ${response.status}`);
 
         const json = await response.json();
@@ -607,7 +608,7 @@ async function compareLocalAndRemoteData() {
         const localData = JSON.parse(await fs.promises.readFile(filePath, "utf8"));
 
         // Obtener datos remotos
-        const response = await fetch(remoteUrl);
+        const response = await fetch(`${remoteUrl}?v=${Date.now()}`);
         if (!response.ok) {
             throw new Error(`Error al obtener datos remotos: ${response.statusText}`);
         }
