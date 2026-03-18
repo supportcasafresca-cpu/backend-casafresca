@@ -598,73 +598,54 @@ app.get("/api/server-status", async (req, res) => {
 
 // Modificar la función para guardar automáticamente en comparison.json
 async function compareLocalAndRemoteData() {
-    const remoteUrl = "https://raw.githubusercontent.com/supportcasafresca-cpu/Analytics-Casa-Fresca/refs/heads/main/Json/my_data.json";
+    const remoteUrl = `https://raw.githubusercontent.com/supportcasafresca-cpu/Analytics-Casa-Fresca/refs/heads/main/Json/my_data.json?v=${Date.now()}`;
     const comparisonFilePath = path.join(directoryPath, "comparison.json");
     let newOrders = [];
     let release;
 
     try {
-        // 1. Leer datos locales (La fuente de verdad actual en el servidor)
+        // Leer datos locales
         const localData = JSON.parse(await fs.promises.readFile(filePath, "utf8"));
-        if (!Array.isArray(localData) || localData.length === 0) return [];
 
-        // 2. Obtener datos remotos (GitHub)
-        // Usamos cache: 'no-store' o el query param que ya tenías para evitar datos viejos
-        const response = await fetch(`${remoteUrl}?v=${Date.now()}`);
-        if (!response.ok) throw new Error(`Error remoto: ${response.statusText}`);
+        // Obtener datos remotos
+        const response = await fetch(remoteUrl);
+
+        if (!response.ok) {
+            throw new Error(`Error al obtener datos remotos: ${response.statusText}`);
+        }
         const remoteData = await response.json();
 
-        // --- MÉTODO 2: OPTIMIZACIÓN ---
-        // En lugar de filtrar todo, buscamos el índice del último pedido que ya conocíamos.
-        // Asumimos que los pedidos nuevos se agregan AL FINAL del array en GitHub.
-        
-        const lastProcessedOrder = remoteData[remoteData.length - 1];
-        
-        if (!lastProcessedOrder) {
-            // Si el remoto está vacío, todo lo local es "nuevo" (o primera sincronización)
-            newOrders = localData.filter(item => item.compras && item.compras.length > 0);
-        } else {
-            // Buscamos en qué posición de mi archivo local está el último pedido que GitHub ya tiene
-            const lastIndexInLocal = localData.findLastIndex(localItem => 
-                localItem.ip === lastProcessedOrder.ip && 
-                localItem.fecha_hora_entrada === lastProcessedOrder.fecha_hora_entrada
-            );
+        // Filtrar pedidos nuevos
+        newOrders = localData.filter(localItem => {
+            const isOrder = Array.isArray(localItem.compras) && localItem.compras.length > 0;
+            if (!isOrder) return false;
 
-            // Si el último de GitHub está en mi local, los "nuevos" son los que están DESPUÉS de ese índice
-            if (lastIndexInLocal !== -1) {
-                newOrders = localData.slice(lastIndexInLocal + 1).filter(item => item.compras && item.compras.length > 0);
-            } else {
-                // Si no encuentro el último de GitHub en mi local, algo cambió drásticamente.
-                // Por seguridad, hacemos el filtro completo que tenías antes (fallback).
-                newOrders = localData.filter(localItem => {
-                    if (!localItem.compras || localItem.compras.length === 0) return false;
-                    return !remoteData.some(remoteItem => 
-                        remoteItem.ip === localItem.ip && 
-                        remoteItem.fecha_hora_entrada === localItem.fecha_hora_entrada
-                    );
-                });
-            }
-        }
+            return !remoteData.some(remoteItem => (
+                Array.isArray(remoteItem.compras) && remoteItem.compras.length > 0 &&
+                remoteItem.ip === localItem.ip &&
+                remoteItem.fecha_hora_entrada === localItem.fecha_hora_entrada
+            ));
+        });
 
-        if (newOrders.length === 0) return [];
+        addLog(`Pedidos nuevos encontrados: ${newOrders.length}`);
 
-        addLog(`Pedidos nuevos detectados: ${newOrders.length}`);
-
-        // 3. Guardar en comparison.json
+        // Guardar los nuevos pedidos en comparison.json
         release = await lockfile.lock(comparisonFilePath);
+        addLog(`Archivo comparison.json bloqueado para escritura: ${comparisonFilePath}`);
+
         await fs.promises.writeFile(
             comparisonFilePath,
             JSON.stringify(newOrders, null, 2),
             "utf8"
         );
-        
-        return newOrders;
+        addLog(`Datos de comparación guardados en: ${comparisonFilePath}`);
 
+        return newOrders;
     } catch (error) {
-        addLog(`ERROR en comparación: ${error.message}`);
+        addLog(`ERROR: No se pudo comparar datos locales y remotos: ${error.message}`);
         throw error;
     } finally {
-        if (release) release();
+        if (release) release(); // Liberar el bloqueo del archivo
     }
 }
 
