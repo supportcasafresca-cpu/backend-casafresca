@@ -597,7 +597,7 @@ app.get("/api/server-status", async (req, res) => {
 
 // Modificar la función para guardar automáticamente en comparison.json
 async function compareLocalAndRemoteData() {
-    const remoteUrl = "https://raw.githubusercontent.com/HCoreBeat/Analytics-Buquenque/refs/heads/main/Json/my_data.json";
+    const remoteUrl = "https://raw.githubusercontent.com/supportcasafresca-cpu/Analytics-Casa-Fresca/refs/heads/main/Json/my_data.json";
     const comparisonFilePath = path.join(directoryPath, "comparison.json");
     let newOrders = [];
     let release;
