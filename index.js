@@ -423,6 +423,8 @@ app.post('/send-pedido', async (req, res) => {
             body: JSON.stringify(orderData),
         });*/
 
+        await enviarNotificacionNuevoPedido(1);
+
         // 3. Procesar las respuestas de texto a JSON de forma segura
         const textResponse1 = await response.text();
         //const textResponse2 = await responseSheets.text();
