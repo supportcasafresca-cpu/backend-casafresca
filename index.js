@@ -7,6 +7,15 @@ const os = require('os');
 const fetch = require("node-fetch");
 exports.fetch = fetch;
 
+const admin = require('firebase-admin');
+
+// Inicializar con la variable de entorno de Render
+const serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG_JSON);
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
+
 const app = express();
 exports.app = app;
 
@@ -68,6 +77,33 @@ app.use(cors({
 
 // Middleware para procesar JSON
 app.use(express.json());
+
+// Función maestra para enviar el push
+async function enviarNotificacionNuevoPedido(cantidad) {
+    const mensaje = {
+        notification: {
+            title: '¡Nuevo Pedido en Casa Fresca! 📦',
+            body: `Tienes ${cantidad} pedido(s) nuevo(s) por procesar.`,
+        },
+        // Usamos un 'topic' para no tener que manejar tokens individuales por ahora
+        topic: 'admin_pedidos', 
+        android: {
+            priority: 'high', // Esto es lo que despierta la app si está cerrada
+            notification: {
+                sound: 'default',
+                clickAction: 'FCM_PLUGIN_ACTIVITY',
+                icon: 'stock_ticker_update' 
+            }
+        }
+    };
+
+    try {
+        await admin.messaging().send(mensaje);
+        addLog("Notificación Push enviada correctamente.");
+    } catch (error) {
+        addLog(`Error enviando Push: ${error.message}`);
+    }
+}
 
 // Configuración de rutas y archivos
 const path = require('path');
@@ -816,6 +852,8 @@ setInterval(async () => {
 
         if (newOrders.length > 0) {
             addLog(`Se encontraron ${newOrders.length} nuevos pedidos en la verificación periódica.`);
+            // Llamamos a la notificación
+            await enviarNotificacionNuevoPedido(newOrders.length);
         } else {
             addLog("No se encontraron nuevos pedidos en la verificación periódica.");
         }
