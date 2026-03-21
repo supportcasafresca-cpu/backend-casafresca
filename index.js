@@ -855,7 +855,6 @@ setInterval(async () => {
         if (newOrders.length > 0) {
             addLog(`Se encontraron ${newOrders.length} nuevos pedidos en la verificación periódica.`);
             // Llamamos a la notificación
-            await enviarNotificacionNuevoPedido(newOrders.length);
         } else {
             addLog("No se encontraron nuevos pedidos en la verificación periódica.");
         }
