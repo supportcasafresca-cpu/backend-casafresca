@@ -5,6 +5,7 @@ const lockfile = require("proper-lockfile");
 const { utcToZonedTime, format: formatTz } = require('date-fns-tz');
 const os = require('os');
 const fetch = require("node-fetch");
+const compression = require('compression');
 exports.fetch = fetch;
 
 const admin = require('firebase-admin');
@@ -19,8 +20,17 @@ admin.initializeApp({
 const app = express();
 exports.app = app;
 
-// Servir archivos estáticos desde la carpeta public
-app.use(express.static('public'));
+// Quitar la cabecera "X-Powered-By: Express" (menos bytes por respuesta, menos huella)
+app.disable('x-powered-by');
+
+// Servir archivos estáticos desde la carpeta public. maxAge le dice al
+// navegador que reutilice el archivo sin volver a pedirlo al backend
+// durante 1 día, lo cual reduce bastante el tráfico servido para
+// imágenes/CSS/JS que casi no cambian.
+app.use(express.static('public', {
+    maxAge: '1d',
+    etag: true
+}));
 
 // Array para almacenar los logs del servidor
 const serverLogs = [];
@@ -45,11 +55,60 @@ function addLog(message) {
     }
 }
 
+// =====================================================================
+// 🧠 CACHÉ EN MEMORIA (mismo patrón que index.js) — reduce peticiones
+// repetidas a GitHub raw (products.json / my_data.json). Varias llamadas
+// cercanas en el tiempo (carga de página + polling de 30s + un pedido
+// entrante casi simultáneo) reutilizan el mismo dato en vez de generar
+// una petición de red nueva cada vez, lo que baja el consumo de tráfico.
+// =====================================================================
+const memoryCache = new Map(); // key -> { data, expires }
+
+function cacheGet(key) {
+    const entry = memoryCache.get(key);
+    if (!entry) return undefined;
+    if (Date.now() > entry.expires) {
+        memoryCache.delete(key);
+        return undefined;
+    }
+    return entry.data;
+}
+
+function cacheSet(key, data, ttlMs) {
+    memoryCache.set(key, { data, expires: Date.now() + ttlMs });
+    return data;
+}
+
+function cacheDel(key) {
+    memoryCache.delete(key);
+}
+
+// Helper genérico: lee de caché o ejecuta fetchFn() y cachea el resultado.
+async function getOrSetCache(key, ttlMs, fetchFn) {
+    const cached = cacheGet(key);
+    if (cached !== undefined) return cached;
+    const fresh = await fetchFn();
+    return cacheSet(key, fresh, ttlMs);
+}
+
+const CACHE_TTL = {
+    PRODUCTS_JSON: 30 * 1000, // products.json remoto usado por /p/:id
+    REMOTE_ORDERS: 8 * 1000   // my_data.json remoto usado por compareLocalAndRemoteData
+};
+
+// Cabecera Cache-Control estándar para endpoints públicos de solo lectura.
+// stale-while-revalidate deja que el navegador siga usando la respuesta
+// vieja mientras revalida en segundo plano, sin bloquear al usuario.
+function setPublicCacheHeaders(res, maxAgeSec = 5, swrSec = 30) {
+    res.set('Cache-Control', `public, max-age=${maxAgeSec}, s-maxage=${maxAgeSec}, stale-while-revalidate=${swrSec}`);
+}
+
 // Configuración de CORS
 const allowedOrigins = [
     "https://casa-fresca.onrender.com",
     "https://backend-casafresca.onrender.com",
     "https://analytics-casafresca.onrender.com",
+    "https://casa-fresca.support-casafresca.workers.dev", // Frontend en Cloudflare Workers
     "http://127.0.0.1:5500",
     "http://localhost:10000",
     'https://localhost',                      // Capacitor Android
@@ -58,6 +117,11 @@ const allowedOrigins = [
     'http://localhost:8100',                   // Ionic Dev Server
     "http://localhost:5500"
 ];
+
+// Render (y la mayoría de PaaS) terminan el HTTPS en un proxy y le hablan a
+// tu app por HTTP puro internamente. Sin esto, Express no detecta bien la
+// IP real del cliente detrás del proxy.
+app.set('trust proxy', 1);
 
 app.use(cors({
     origin: function (origin, callback) {
@@ -75,8 +139,15 @@ app.use(cors({
     credentials: true
 }));
 
-// Middleware para procesar JSON
-app.use(express.json());
+// Compresión gzip/brotli de las respuestas (igual que en index.js): reduce
+// notablemente el tráfico transferido, sobre todo en /obtener-estadisticas
+// y /api/get-comparison, que pueden devolver JSON largos.
+app.use(compression());
+
+// Middleware para procesar JSON, con límite explícito para evitar payloads
+// descontrolados (antes no tenía límite definido).
+app.use(express.json({ limit: '5mb' }));
+app.use(express.urlencoded({ extended: true, limit: '5mb' }));
 
 // Función maestra para enviar el push
 async function enviarNotificacionNuevoPedido(cantidad) {
@@ -185,11 +256,14 @@ app.get(/^\/p\/(.*)/, async (req, res) => {
     const PRODUCTS_URL = "https://raw.githubusercontent.com/supportcasafresca-cpu/Casa-Fresca/refs/heads/main/Json/products.json";
 
     try {
-        const response = await fetch(`${PRODUCTS_URL}?v=${Date.now()}`);
-
-        if (!response.ok) throw new Error(`Fetch fallido: ${response.status}`);
-
-        const json = await response.json();
+        // Caché de 30s: los bots de WhatsApp/Facebook y los usuarios que
+        // comparten el mismo link golpean esta ruta muchas veces seguidas;
+        // sin caché cada visita descargaba products.json completo de GitHub.
+        const json = await getOrSetCache('products-json', CACHE_TTL.PRODUCTS_JSON, async () => {
+            const response = await fetch(PRODUCTS_URL);
+            if (!response.ok) throw new Error(`Fetch fallido: ${response.status}`);
+            return response.json();
+        });
         
         // Búsqueda en el JSON
         const product = Array.isArray(json.products) && json.products.find(p => {
@@ -428,8 +502,10 @@ app.post('/send-pedido', async (req, res) => {
         // 3. Procesar las respuestas de texto a JSON de forma segura
         const textResponse1 = await response.text();
         //const textResponse2 = await responseSheets.text();
-        
-        //let gasResponse, gasResponseSheets;
+
+        // NOTA: esta variable estaba comentada en el original (era global
+        // implícita). Se declara explícitamente para evitar errores.
+        let gasResponse;
 
         // Parseo seguro respuesta 1
         try {
@@ -636,7 +712,7 @@ app.get("/api/server-status", async (req, res) => {
 
 // Modificar la función para guardar automáticamente en comparison.json
 async function compareLocalAndRemoteData() {
-    const remoteUrl = `https://raw.githubusercontent.com/supportcasafresca-cpu/Analytics-Casa-Fresca/refs/heads/main/Json/my_data.json?v=${Date.now()}`;
+    const remoteUrl = "https://raw.githubusercontent.com/supportcasafresca-cpu/Analytics-Casa-Fresca/refs/heads/main/Json/my_data.json";
     const comparisonFilePath = path.join(directoryPath, "comparison.json");
     let newOrders = [];
     let release;
@@ -645,13 +721,16 @@ async function compareLocalAndRemoteData() {
         // Leer datos locales
         const localData = JSON.parse(await fs.promises.readFile(filePath, "utf8"));
 
-        // Obtener datos remotos
-        const response = await fetch(remoteUrl);
-
-        if (!response.ok) {
-            throw new Error(`Error al obtener datos remotos: ${response.statusText}`);
-        }
-        const remoteData = await response.json();
+        // Obtener datos remotos (caché corta de 8s): evita golpear el CDN
+        // de GitHub varias veces casi al mismo tiempo cuando coinciden el
+        // polling de 30s, la carga de "/" y un pedido entrante.
+        const remoteData = await getOrSetCache('remote-orders-json', CACHE_TTL.REMOTE_ORDERS, async () => {
+            const response = await fetch(remoteUrl);
+            if (!response.ok) {
+                throw new Error(`Error al obtener datos remotos: ${response.statusText}`);
+            }
+            return response.json();
+        });
 
         // Filtrar pedidos nuevos
         newOrders = localData.filter(localItem => {
@@ -746,6 +825,10 @@ app.post("/api/clear-statistics", async (req, res) => {
         });
         addLog("Nuevo archivo de estadísticas creado correctamente");
 
+        // Invalidar caché del remoto: tras un reset manual queremos datos
+        // frescos sí o sí, no la última copia cacheada.
+        cacheDel('remote-orders-json');
+
         // Comparar datos locales y remotos después de limpiar estadísticas
         const newOrders = await compareLocalAndRemoteData();
 
@@ -775,6 +858,7 @@ app.get("/api/get-comparison", async (req, res) => {
         const data = await fs.promises.readFile(comparisonFilePath, "utf8");
         const comparisonData = JSON.parse(data);
 
+        setPublicCacheHeaders(res, 5, 30);
         res.json({ success: true, comparisonData });
     } catch (error) {
         addLog(`ERROR: No se pudo leer comparison.json: ${error.message}`);
@@ -787,10 +871,12 @@ app.get('/api/new-orders', async (req, res) => {
     const comparisonFilePath = path.join(directoryPath, "comparison.json");
     try {
         if (!fs.existsSync(comparisonFilePath)) {
+            setPublicCacheHeaders(res, 5, 30);
             return res.json({ success: true, newOrders: [] });
         }
         const data = await fs.promises.readFile(comparisonFilePath, 'utf8');
         const newOrders = JSON.parse(data);
+        setPublicCacheHeaders(res, 5, 30);
         res.json({ success: true, newOrders });
     } catch (error) {
         console.error('Error al leer comparison.json:', error);
