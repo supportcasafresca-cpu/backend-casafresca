@@ -244,28 +244,34 @@ setInterval(() => {
     }
 }, Math.max(30000, Math.floor(RATE_LIMIT_WINDOW_MS / 2)));
 
-const cloudinary = require('cloudinary').v2;
+let cloudinary = null;
 const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
-const CLOUDINARY_PRODUCTS_FOLDER = process.env.CLOUDINARY_PRODUCTS_FOLDER;
-const CLOUDINARY_PACKS_FOLDER = process.env.CLOUDINARY_PACKS_FOLDER;
-if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_PRODUCTS_FOLDER || !CLOUDINARY_PACKS_FOLDER ||
-    !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
-    throw new Error('Falta configurar Cloudinary y las carpetas propias de Casa Fresca en el entorno.');
+const CLOUDINARY_PRODUCTS_FOLDER = 'products';
+const CLOUDINARY_PACKS_FOLDER = 'packs';
+let cloudinaryConfigured = false;
+
+try {
+    cloudinary = require('cloudinary').v2;
+} catch (error) {
+    console.warn('WARN: cloudinary no está instalado. La subida/borrado de imágenes se omitirá.');
 }
-cloudinary.config({
-    cloud_name: CLOUDINARY_CLOUD_NAME,
-    api_key: process.env.CLOUDINARY_API_KEY,
-    api_secret: process.env.CLOUDINARY_API_SECRET
-});
+
+if (cloudinary && CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET) {
+    cloudinary.config({
+        cloud_name: CLOUDINARY_CLOUD_NAME,
+        api_key: process.env.CLOUDINARY_API_KEY,
+        api_secret: process.env.CLOUDINARY_API_SECRET
+    });
+    cloudinaryConfigured = true;
+} else if (cloudinary) {
+    console.warn('WARN: Cloudinary no está totalmente configurado (faltan CLOUDINARY_CLOUD_NAME/API_KEY/API_SECRET). La subida/borrado de imágenes se omitirá.');
+}
 
 // Sube una imagen a Cloudinary. Acepta un data URI (base64) o una URL remota.
 // Se convierte automáticamente a WebP para reducir el peso de las imágenes
 // y ahorrar tráfico en entornos con límites mensuales.
 async function cloudinaryUploadProductImage(source, desiredPublicId, folder = CLOUDINARY_PRODUCTS_FOLDER) {
-    if (!source) return null;
-    if (!folder) {
-        throw new Error('Cloudinary no está configurado para subir imágenes.');
-    }
+    if (!cloudinaryConfigured || !source) return null;
     const uploadOptions = {
         folder,
         overwrite: true,
@@ -279,17 +285,26 @@ async function cloudinaryUploadProductImage(source, desiredPublicId, folder = CL
         uploadOptions.public_id = desiredPublicId;
     }
 
-    const result = await cloudinary.uploader.upload(source, uploadOptions);
-    const prefix = `${folder}/`;
-    return result.public_id.startsWith(prefix)
-        ? result.public_id.slice(prefix.length)
-        : result.public_id;
+    try {
+        const result = await cloudinary.uploader.upload(source, uploadOptions);
+        const prefix = `${folder}/`;
+        return result.public_id.startsWith(prefix)
+            ? result.public_id.slice(prefix.length)
+            : result.public_id;
+    } catch (error) {
+        console.warn('WARN: No se pudo subir la imagen a Cloudinary:', error.message);
+        return null;
+    }
 }
 
 async function cloudinaryDeleteProductImage(publicIdRelative, folder) {
-    if (!publicIdRelative) return;
+    if (!cloudinaryConfigured || !publicIdRelative) return;
     const publicId = folder ? `${folder}/${publicIdRelative}` : publicIdRelative;
-    await cloudinary.uploader.destroy(publicId, { resource_type: 'image' });
+    try {
+        await cloudinary.uploader.destroy(publicId, { resource_type: 'image' });
+    } catch (error) {
+        console.warn(`WARN: No se pudo eliminar la imagen de Cloudinary (${publicIdRelative}):`, error.message);
+    }
 }
 
 function addImageUrls(item, folder) {
@@ -297,9 +312,10 @@ function addImageUrls(item, folder) {
     const imagenesUrl = (Array.isArray(item.imagenes) ? item.imagenes : [])
         .filter(Boolean)
         .map(publicId => {
+            if (!CLOUDINARY_CLOUD_NAME) return null;
             const publicIdPath = String(publicId).split('/').map(encodeURIComponent).join('/');
             return `https://res.cloudinary.com/${CLOUDINARY_CLOUD_NAME}/image/upload/f_webp,q_auto/${folderPath}/${publicIdPath}`;
-        });
+        }).filter(Boolean);
     return { ...item, imagenes_url: imagenesUrl };
 }
 
@@ -312,8 +328,12 @@ async function processProductImages(imagenes, existingPublicIds = [], folder = C
     const processed = [];
     for (const value of list) {
         if (isUploadableImageValue(value)) {
-            const publicId = await cloudinaryUploadProductImage(value, undefined, folder);
-            if (publicId) processed.push(publicId);
+            try {
+                const publicId = await cloudinaryUploadProductImage(value, undefined, folder);
+                if (publicId) processed.push(publicId);
+            } catch (error) {
+                console.warn('WARN: Se omitió una imagen al procesar el producto/pack:', error.message);
+            }
         } else if (value) {
             processed.push(value);
         }

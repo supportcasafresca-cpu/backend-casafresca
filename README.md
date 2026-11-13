@@ -9,7 +9,7 @@ Express service for Casa Fresca. The browser talks to this API; it does not conn
 3. Run `npm test`.
 4. Start locally with `npm start`.
 
-The service requires primary and secondary Firebase Realtime Database credentials and URLs, Cloudinary credentials and Casa Fresca folder names, and a stable `SESSION_SECRET`. The mail integration uses `GOOGLE_APPS_SCRIPT_CORREO_URL`; set it to the existing Casa Fresca Apps Script Web App URL in the private Render environment. Do not commit the value.
+The service requires primary and secondary Firebase Realtime Database credentials and URLs and a stable `SESSION_SECRET`. Cloudinary uploads use the `products` and `packs` folders by default. Cloudinary credentials are needed for image uploads, deletions, and usage reporting; without them, the API can start but those functions are unavailable. The mail integration uses `GOOGLE_APPS_SCRIPT_CORREO_URL`; set it to the Casa Fresca Apps Script Web App URL in the private Render environment. Do not commit the value.
 
 ## Realtime Database layout
 
@@ -35,7 +35,7 @@ The current backend reads whole nodes and does not issue RTDB `orderByChild`/`or
 
 ## Cloudinary
 
-Uploads are signed by this server using `CLOUDINARY_API_KEY` and `CLOUDINARY_API_SECRET`. Configure new Casa Fresca folder values with `CLOUDINARY_PRODUCTS_FOLDER` and `CLOUDINARY_PACKS_FOLDER`. Do not reuse another business's cloud name or folder paths. The browser never receives the API secret. An unsigned upload preset is not used by this signed-upload flow.
+Uploads are signed by this server using `CLOUDINARY_API_KEY` and `CLOUDINARY_API_SECRET`, and are stored in the `products` and `packs` folders in Casa Fresca's own Cloudinary account. The browser never receives the API secret. An unsigned upload preset is not used by this signed-upload flow. Cloudinary configuration is optional at startup, but image upload, deletion, and usage reporting remain unavailable until its credentials are configured.
 
 ## Catalog migration
 

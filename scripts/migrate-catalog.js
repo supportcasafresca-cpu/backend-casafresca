@@ -84,7 +84,7 @@ async function run() {
   const serviceAccount = JSON.parse(requiredEnv('FIREBASE_SERVICE_ACCOUNT'));
   const databaseUrl = requiredEnv('FIREBASE_DATABASE_URL');
   const cloudName = requiredEnv('CLOUDINARY_CLOUD_NAME');
-  const productsFolder = requiredEnv('CLOUDINARY_PRODUCTS_FOLDER');
+  const productsFolder = 'products';
   const cloudinary = require('cloudinary').v2;
   const admin = require('firebase-admin');
 
