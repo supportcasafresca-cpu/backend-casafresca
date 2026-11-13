@@ -1,0 +1,114 @@
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'Inter', Arial, sans-serif;
+    background: #08090b;
+}
+
+.login-wrapper {
+    width: 100%;
+    max-width: 380px;
+    padding: 20px;
+}
+
+.login-card {
+    background: #131519;
+    border: 1px solid #23262c;
+    border-radius: 14px;
+    padding: 32px 28px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+.login-header {
+    text-align: center;
+    margin-bottom: 24px;
+}
+
+.login-header i {
+    font-size: 32px;
+    color: #7c6cf6;
+}
+
+.login-header h1 {
+    font-size: 20px;
+    margin: 10px 0 4px;
+    color: #eef0f2;
+}
+
+.login-header p {
+    font-size: 13px;
+    color: #9aa1ab;
+    margin: 0;
+}
+
+.form-group {
+    margin-bottom: 16px;
+}
+
+.form-group label {
+    display: block;
+    font-size: 13px;
+    font-weight: 600;
+    color: #9aa1ab;
+    margin-bottom: 6px;
+}
+
+.form-group input {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid #23262c;
+    background: #0e1013;
+    color: #eef0f2;
+    border-radius: 8px;
+    font-size: 14px;
+    font-family: inherit;
+}
+
+.form-group input:focus {
+    outline: none;
+    border-color: #7c6cf6;
+}
+
+.login-btn {
+    width: 100%;
+    padding: 12px;
+    border: none;
+    border-radius: 8px;
+    background-color: #7c6cf6;
+    color: #ffffff;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    margin-top: 6px;
+    transition: background-color 0.15s ease;
+}
+
+.login-btn:hover {
+    background-color: #6a5cf0;
+}
+
+.login-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.login-error {
+    background-color: rgba(242, 84, 91, 0.12);
+    color: #f2545b;
+    border: 1px solid rgba(242, 84, 91, 0.35);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 13px;
+    margin-bottom: 16px;
+}

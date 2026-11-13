@@ -1,36 +1,325 @@
+require('dotenv').config();
+
 const express = require("express");
 const fs = require("fs");
+const path = require('path');
 const cors = require("cors");
 const lockfile = require("proper-lockfile");
 const { utcToZonedTime, format: formatTz } = require('date-fns-tz');
 const os = require('os');
+const crypto = require('crypto');
 const fetch = require("node-fetch");
-const compression = require('compression');
 exports.fetch = fetch;
+const session = require('express-session');
+const bcrypt = require('bcryptjs');
+const compression = require('compression');
+const { addRecord: addStatsSummaryRecord, buildSummaryFromRecords, createEmptySummary, toSummaryResponse } = require('./stats-summary');
+const { createPresenceTracker } = require('./analytics-presence');
 
 const admin = require('firebase-admin');
 
 // Inicializar con la variable de entorno de Render
-const serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG_JSON);
+if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
+    console.error("ERROR CRÍTICO: La variable de entorno FIREBASE_SERVICE_ACCOUNT no está definida.");
+    process.exit(1); // Detenemos el servidor para que el log sea claro y no arranque a medias
+}
+
+// Inicializar con la variable de entorno de Render
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+
+// La URL de tu Realtime Database (Consola Firebase -> Realtime Database -> arriba de la tabla de datos).
+// También puedes definirla como variable de entorno FIREBASE_DATABASE_URL en Render.
+const FIREBASE_DATABASE_URL = process.env.FIREBASE_DATABASE_URL;
+const PUBLIC_SITE_URL = process.env.PUBLIC_SITE_URL;
+if (!FIREBASE_DATABASE_URL) {
+    throw new Error('Falta la variable de entorno FIREBASE_DATABASE_URL.');
+}
 
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
+  credential: admin.credential.cert(serviceAccount),
+  databaseURL: FIREBASE_DATABASE_URL
 });
+
+// Referencia reutilizable a la Realtime Database desde el backend
+const rtdb = admin.database();
+
+// =====================================================================
+// 🧠 CACHÉ EN MEMORIA (reduce lecturas repetidas a Firebase RTDB)
+// =====================================================================
+
+const memoryCache = new Map(); // key -> { data, expires }
+// Peticiones en vuelo: si dos endpoints piden la misma colección al mismo
+// tiempo (p. ej. /api/pedidos y /api/pedidos-asignados en paralelo), solo se
+// hace UNA lectura a Firebase y ambos esperan el mismo resultado. Sin esto,
+// cada ciclo del panel descargaba /pedidos dos veces.
+const inflightCache = new Map(); // key -> Promise
+// Generación de caché: se incrementa en cada invalidación. Si una lectura a
+// Firebase estaba en curso cuando se escribió un pedido, su resultado ya es
+// viejo y NO debe guardarse (serviría datos obsoletos durante todo el TTL).
+let cacheGeneration = 0;
+
+function cacheGet(key) {
+    const entry = memoryCache.get(key);
+    if (!entry) return undefined;
+    if (Date.now() > entry.expires) {
+        memoryCache.delete(key);
+        return undefined;
+    }
+    return entry.data;
+}
+
+function cacheSet(key, data, ttlMs) {
+    memoryCache.set(key, { data, expires: Date.now() + ttlMs });
+    return data;
+}
+
+function cacheDel(key) {
+    memoryCache.delete(key);
+    inflightCache.delete(key);
+    cacheGeneration += 1;
+}
+
+function cacheDelPrefix(prefix) {
+    for (const key of memoryCache.keys()) {
+        if (key.startsWith(prefix)) memoryCache.delete(key);
+    }
+    for (const key of inflightCache.keys()) {
+        if (key.startsWith(prefix)) inflightCache.delete(key);
+    }
+    cacheGeneration += 1;
+}
+
+// TTLs por tipo de dato: catálogo se refresca rápido (se edita seguido
+// desde el panel), datos casi estáticos usan TTL más largo.
+const CACHE_TTL = {
+    CATALOG: 30 * 1000,        // products / packs
+    PUBLIC_DATA: 60 * 1000,    // afiliados, mensajes, evento, info, pay
+    NOTIFICATION: 30 * 1000,   // notification-banner
+    RATINGS: 30 * 1000,        // product-ratings por producto
+    KNOWN_IPS: 5 * 60 * 1000,  // set de IPs conocidas (usuario recurrente)
+    CLOUDINARY_USAGE: 5 * 60 * 1000, // uso/consumo de la cuenta de Cloudinary
+    // Listados de la RTDB secundaria. Antes eran 20 s y los paneles sondeaban
+    // cada 20-30 s, así que la caché NUNCA acertaba: cada sondeo bajaba el nodo
+    // completo de Firebase. Con 2 min la lectura real a RTDB baja ~6x y los
+    // cambios propios siguen viéndose al instante porque se invalida al escribir.
+    PUSH_LIST: 2 * 60 * 1000,
+    ORDERS_BRANCH: 2 * 60 * 1000,
+    STATS: 60 * 60 * 1000,     // /estadisticas: colección creciente, no requiere frescura de minutos
+    UPTIME_HISTORY: 5 * 60 * 1000,   // historial diario de actividad del servidor
+    RENDER_METRICS: 10 * 60 * 1000,  // métricas obtenidas de la API de Render
+    RENDER_SERVICE: 10 * 60 * 1000,  // info del servicio (repo, branch, plan)
+    RENDER_DEPLOYS: 60 * 1000,       // lista de despliegues recientes
+    RENDER_EVENTS: 60 * 1000,        // timeline de eventos del servicio
+    ADMIN_AUTH: 30 * 1000             // credenciales/epoch de admin
+};
+
+// Helper genérico: lee de caché o ejecuta fetchFn() y cachea el resultado.
+// Deduplica peticiones concurrentes de la misma clave.
+async function getOrSetCache(key, ttlMs, fetchFn) {
+    const cached = cacheGet(key);
+    if (cached !== undefined) return cached;
+    if (inflightCache.has(key)) return await inflightCache.get(key);
+
+    const generationAtStart = cacheGeneration;
+    const promise = fetchFn()
+        .then(fresh => {
+            // Si hubo una escritura mientras se leía, el resultado ya es viejo:
+            // se devuelve a quien lo pidió pero no se guarda en caché.
+            return generationAtStart === cacheGeneration ? cacheSet(key, fresh, ttlMs) : fresh;
+        })
+        .finally(() => {
+            if (inflightCache.get(key) === promise) inflightCache.delete(key);
+        });
+    inflightCache.set(key, promise);
+    return await promise;
+}
+
+// Envía JSON con ETag y Cache-Control. Si el cliente ya tiene la misma
+// versión (If-None-Match), responde 304 sin cuerpo: el panel deja de
+// re-descargar listados que no cambiaron.
+function sendJsonSmart(req, res, payload, options = {}) {
+    const { maxAge = 0, isPublic = false } = options;
+    const json = JSON.stringify(payload);
+    const etag = `"${crypto.createHash('sha1').update(json).digest('base64url')}"`;
+    res.set('ETag', etag);
+    res.set('Cache-Control', `${isPublic ? 'public' : 'private'}, max-age=${maxAge}, must-revalidate`);
+    const inm = req && req.headers ? String(req.headers['if-none-match'] || '') : '';
+    const matches = inm.split(',').some(value => value.trim() === etag || value.trim() === 'W/' + etag);
+    if (matches) {
+        return res.status(304).end();
+    }
+    res.type('application/json').send(json);
+}
+
+// Cabecera Cache-Control estándar para endpoints públicos de solo lectura.
+// stale-while-revalidate deja que el navegador siga usando la respuesta
+// vieja mientras revalida en segundo plano, sin bloquear al usuario.
+function setPublicCacheHeaders(res, maxAgeSec = 30, swrSec = 120) {
+    res.set('Cache-Control', `public, max-age=${maxAgeSec}, s-maxage=${maxAgeSec}, stale-while-revalidate=${swrSec}`);
+}
+
+function paginateArray(array, req) {
+    const list = Array.isArray(array) ? array : [];
+    const limitRaw = req.query && req.query.limit;
+    if (limitRaw === undefined) {
+        return { items: list, paginated: false };
+    }
+    const limit = Math.max(1, Math.min(500, parseInt(limitRaw, 10) || list.length));
+    const offset = Math.max(0, parseInt((req.query && req.query.offset) || '0', 10) || 0);
+    return {
+        items: list.slice(offset, offset + limit),
+        paginated: true,
+        total: list.length,
+        limit,
+        offset
+    };
+}
 
 const app = express();
 exports.app = app;
+const analyticsPresence = createPresenceTracker();
 
-// Quitar la cabecera "X-Powered-By: Express" (menos bytes por respuesta, menos huella)
-app.disable('x-powered-by');
+// Configuración de CORS
+// Asegúrate de tener cargado dotenv al inicio de tu app: require('dotenv').config();
 
-// Servir archivos estáticos desde la carpeta public. maxAge le dice al
-// navegador que reutilice el archivo sin volver a pedirlo al backend
-// durante 1 día, lo cual reduce bastante el tráfico servido para
-// imágenes/CSS/JS que casi no cambian.
-app.use(express.static('public', {
-    maxAge: '1d',
-    etag: true
-}));
+const allowedOrigins = process.env.ALLOWED_ORIGINS 
+  ? process.env.ALLOWED_ORIGINS.split(',') 
+  : [];
+;
+
+// -----------------------------
+// Rate limiting (protección básica)
+// -----------------------------
+const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60000);
+const RATE_LIMIT_MAX_REQUESTS = Number(process.env.RATE_LIMIT_MAX_REQUESTS || 60);
+const RATE_LIMIT_WHITELIST = (process.env.RATE_LIMIT_WHITELIST || '').split(',').map(s => s.trim()).filter(Boolean);
+
+const rateLimitStore = new Map(); // key -> { timestamps: [ms,...] }
+
+function _getRemoteIp(req) {
+    // req.ip ya resuelve correctamente el IP real del cliente respetando
+    // 'trust proxy', sin poder ser falseado agregando X-Forwarded-For propio.
+    return (req.ip || (req.connection && req.connection.remoteAddress) || 'unknown').toString();
+}
+
+function rateLimitMiddleware(req, res, next) {
+    try {
+        const ip = _getRemoteIp(req) || 'unknown';
+        if (RATE_LIMIT_WHITELIST.includes(ip)) return next();
+
+        const now = Date.now();
+        const key = `${ip}:${req.path}`;
+        const record = rateLimitStore.get(key) || { timestamps: [] };
+
+        // Limpiar timestamps fuera de ventana
+        record.timestamps = record.timestamps.filter(ts => ts > now - RATE_LIMIT_WINDOW_MS);
+        record.timestamps.push(now);
+        rateLimitStore.set(key, record);
+
+        const used = record.timestamps.length;
+        const remaining = Math.max(0, RATE_LIMIT_MAX_REQUESTS - used);
+        res.setHeader('X-RateLimit-Limit', String(RATE_LIMIT_MAX_REQUESTS));
+        res.setHeader('X-RateLimit-Remaining', String(remaining));
+
+        if (used > RATE_LIMIT_MAX_REQUESTS) {
+            const retryAfterSec = Math.ceil((record.timestamps[0] + RATE_LIMIT_WINDOW_MS - now) / 1000);
+            res.setHeader('Retry-After', String(retryAfterSec));
+            return res.status(429).json({ error: 'Demasiadas solicitudes. Intenta de nuevo más tarde.' });
+        }
+
+        next();
+    } catch (err) {
+        console.warn('rateLimitMiddleware error', err && err.message ? err.message : err);
+        next();
+    }
+}
+
+// Limpieza periódica del store para evitar crecimiento indefinido
+setInterval(() => {
+    const cutoff = Date.now() - (RATE_LIMIT_WINDOW_MS * 2);
+    for (const [key, rec] of rateLimitStore.entries()) {
+        rec.timestamps = rec.timestamps.filter(ts => ts > cutoff);
+        if (!rec.timestamps.length) rateLimitStore.delete(key);
+        else rateLimitStore.set(key, rec);
+    }
+}, Math.max(30000, Math.floor(RATE_LIMIT_WINDOW_MS / 2)));
+
+const cloudinary = require('cloudinary').v2;
+const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
+const CLOUDINARY_PRODUCTS_FOLDER = process.env.CLOUDINARY_PRODUCTS_FOLDER;
+const CLOUDINARY_PACKS_FOLDER = process.env.CLOUDINARY_PACKS_FOLDER;
+if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_PRODUCTS_FOLDER || !CLOUDINARY_PACKS_FOLDER ||
+    !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
+    throw new Error('Falta configurar Cloudinary y las carpetas propias de Casa Fresca en el entorno.');
+}
+cloudinary.config({
+    cloud_name: CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+// Sube una imagen a Cloudinary. Acepta un data URI (base64) o una URL remota.
+// Se convierte automáticamente a WebP para reducir el peso de las imágenes
+// y ahorrar tráfico en entornos con límites mensuales.
+async function cloudinaryUploadProductImage(source, desiredPublicId, folder = CLOUDINARY_PRODUCTS_FOLDER) {
+    if (!source) return null;
+    if (!folder) {
+        throw new Error('Cloudinary no está configurado para subir imágenes.');
+    }
+    const uploadOptions = {
+        folder,
+        overwrite: true,
+        invalidate: true,
+        resource_type: 'image',
+        format: 'webp',
+        fetch_format: 'webp',
+        quality: 'auto'
+    };
+    if (desiredPublicId) {
+        uploadOptions.public_id = desiredPublicId;
+    }
+
+    const result = await cloudinary.uploader.upload(source, uploadOptions);
+    const prefix = `${folder}/`;
+    return result.public_id.startsWith(prefix)
+        ? result.public_id.slice(prefix.length)
+        : result.public_id;
+}
+
+async function cloudinaryDeleteProductImage(publicIdRelative, folder) {
+    if (!publicIdRelative) return;
+    const publicId = folder ? `${folder}/${publicIdRelative}` : publicIdRelative;
+    await cloudinary.uploader.destroy(publicId, { resource_type: 'image' });
+}
+
+function addImageUrls(item, folder) {
+    const folderPath = folder.split('/').map(encodeURIComponent).join('/');
+    const imagenesUrl = (Array.isArray(item.imagenes) ? item.imagenes : [])
+        .filter(Boolean)
+        .map(publicId => {
+            const publicIdPath = String(publicId).split('/').map(encodeURIComponent).join('/');
+            return `https://res.cloudinary.com/${CLOUDINARY_CLOUD_NAME}/image/upload/f_webp,q_auto/${folderPath}/${publicIdPath}`;
+        });
+    return { ...item, imagenes_url: imagenesUrl };
+}
+
+function isUploadableImageValue(value) {
+    return typeof value === 'string' && (value.startsWith('data:image/') || /^https?:\/\//i.test(value));
+}
+
+async function processProductImages(imagenes, existingPublicIds = [], folder = CLOUDINARY_PRODUCTS_FOLDER) {
+    const list = Array.isArray(imagenes) ? imagenes : (imagenes ? [imagenes] : []);
+    const processed = [];
+    for (const value of list) {
+        if (isUploadableImageValue(value)) {
+            const publicId = await cloudinaryUploadProductImage(value, undefined, folder);
+            if (publicId) processed.push(publicId);
+        } else if (value) {
+            processed.push(value);
+        }
+    }
+    return processed;
+}
 
 // Array para almacenar los logs del servidor
 const serverLogs = [];
@@ -55,148 +344,1789 @@ function addLog(message) {
     }
 }
 
-// =====================================================================
-// 🧠 CACHÉ EN MEMORIA (mismo patrón que index.js) — reduce peticiones
-// repetidas a GitHub raw (products.json / my_data.json). Varias llamadas
-// cercanas en el tiempo (carga de página + polling de 30s + un pedido
-// entrante casi simultáneo) reutilizan el mismo dato en vez de generar
-// una petición de red nueva cada vez, lo que baja el consumo de tráfico.
-// =====================================================================
-const memoryCache = new Map(); // key -> { data, expires }
+const UPTIME_DAILY_PATH = 'server_health/uptime_daily';
+const UPTIME_HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
+const UPTIME_TIMEZONE = 'America/Havana';
 
-function cacheGet(key) {
-    const entry = memoryCache.get(key);
-    if (!entry) return undefined;
-    if (Date.now() > entry.expires) {
-        memoryCache.delete(key);
-        return undefined;
+function todayKeyInTimeZone(timeZone) {
+    return nowInTimeZone(timeZone).slice(0, 10);
+}
+
+async function recordUptimeHeartbeat() {
+    try {
+        const dayKey = todayKeyInTimeZone(UPTIME_TIMEZONE);
+        const incrementSeconds = Math.floor(UPTIME_HEARTBEAT_INTERVAL_MS / 1000);
+        await rtdb.ref(`${UPTIME_DAILY_PATH}/${dayKey}`).transaction(current => (Number(current) || 0) + incrementSeconds);
+        cacheDel('uptime-history');
+    } catch (err) {
+        console.warn('WARN: no se pudo registrar el heartbeat de actividad:', err.message);
     }
-    return entry.data;
 }
 
-function cacheSet(key, data, ttlMs) {
-    memoryCache.set(key, { data, expires: Date.now() + ttlMs });
-    return data;
+// =====================================================
+// 📅 CRON DIARIO: Notificación FCM para entregas de mañana
+// =====================================================
+const DELIVERY_NOTIFICATION_HOUR = 8; // Hora en Cuba (America/Havana) para enviar la notificación
+const DELIVERY_NOTIFICATION_MINUTE = 0;
+
+async function checkAndNotifyTomorrowDeliveries() {
+    try {
+        if (!secondaryRtdb) {
+            addLog('WARN: No hay RTDB secundaria, saltando verificación de entregas de mañana');
+            return;
+        }
+
+        const hoy = new Date();
+        const zonedHoy = utcToZonedTime(hoy, 'America/Havana');
+        const manana = new Date(zonedHoy);
+        manana.setDate(manana.getDate() + 1);
+        const mananaStr = formatTz(manana, 'yyyy-MM-dd', { timeZone: 'America/Havana' });
+
+        addLog(`Verificando pedidos con fecha_entrega = ${mananaStr} (mañana)`);
+
+        const asignados = await listSecondaryPushCollection(PEDIDOS_ASIGNADOS_RTDB_PATH);
+        const pedidos = await listSecondaryPushCollection(PEDIDOS_RTDB_PATH);
+        const pedidosPorId = new Map(pedidos.map(p => [p.id, p]));
+
+        // Filtrar pedidos en seguimiento que tengan fecha_entrega = mañana
+        const pedidosManana = [];
+        for (const asignado of asignados) {
+            if (!asignado.pedido_origen_id) continue;
+            const pedidoOrigen = pedidosPorId.get(asignado.pedido_origen_id);
+            if (!pedidoOrigen) continue;
+
+            // Solo pedidos en proceso (no completados)
+            const estadoKey = (
+                (asignado.entregado && asignado.pagado) ? 'completado' :
+                (asignado.pagado && !asignado.entregado) ? 'pagado' :
+                (asignado.aceptado || asignado.entregado || asignado.pendiente_pago) ? 'proceso' : 'pendiente'
+            );
+            if (estadoKey === 'completado') continue;
+
+            if (asignado.fecha_entrega === mananaStr) {
+                pedidosManana.push({ ...pedidoOrigen, ...asignado });
+            }
+        }
+
+        if (pedidosManana.length === 0) {
+            addLog(`No hay pedidos para entregar mañana (${mananaStr})`);
+            return;
+        }
+
+        // Preparar mensaje de notificación
+        const count = pedidosManana.length;
+        const ordenes = pedidosManana.map(p => p.orderNumber || p.numero_orden || p.id).slice(0, 5).join(', ');
+        const masTexto = count > 5 ? ` y ${count - 5} más` : '';
+        const titulo = `📦 ${count} pedido${count > 1 ? 's' : ''} para entregar mañana`;
+        const cuerpo = `Órdenes: ${ordenes}${masTexto}. Fecha: ${mananaStr}`;
+
+        addLog(`Enviando notificación FCM para ${count} pedido(s) de mañana: ${cuerpo}`);
+
+        // Enviar notificación FCM al topic 'pedidos'
+        const responsePush = await admin.messaging().send({
+            notification: {
+                title: titulo,
+                body: cuerpo
+            },
+            data: {
+                tipo: 'entregas_manana',
+                fecha_entrega: mananaStr,
+                cantidad: String(count),
+                ordenes: ordenes,
+                click_action: 'FLUTTER_NOTIFICATION_CLICK'
+            },
+            topic: 'pedidos'
+        });
+
+        addLog(`✅ Notificación FCM de entregas de mañana enviada: ${responsePush}`);
+    } catch (error) {
+        addLog(`❌ Error en checkAndNotifyTomorrowDeliveries: ${error.message}`);
+        console.error('Error en checkAndNotifyTomorrowDeliveries:', error);
+    }
 }
 
-function cacheDel(key) {
-    memoryCache.delete(key);
+function scheduleDailyDeliveryNotification() {
+    const now = new Date();
+    const zonedNow = utcToZonedTime(now, 'America/Havana');
+    
+    // Calcular cuándo es la próxima ejecución (mañana a las 8:00 AM Cuba time)
+    const nextRun = new Date(zonedNow);
+    nextRun.setHours(DELIVERY_NOTIFICATION_HOUR, DELIVERY_NOTIFICATION_MINUTE, 0, 0);
+    
+    // Si ya pasó la hora de hoy, programar para mañana
+    if (nextRun <= zonedNow) {
+        nextRun.setDate(nextRun.getDate() + 1);
+    }
+    
+    const msUntilNextRun = nextRun.getTime() - zonedNow.getTime();
+    
+    addLog(`Próxima verificación de entregas de mañana programada para: ${formatTz(nextRun, 'yyyy-MM-dd HH:mm:ss', { timeZone: 'America/Havana' })} (en ${Math.round(msUntilNextRun / 1000 / 60)} minutos)`);
+    
+    setTimeout(() => {
+        checkAndNotifyTomorrowDeliveries();
+        // Reprogramar para el día siguiente (24 horas)
+        setInterval(checkAndNotifyTomorrowDeliveries, 24 * 60 * 60 * 1000);
+    }, msUntilNextRun);
 }
 
-// Helper genérico: lee de caché o ejecuta fetchFn() y cachea el resultado.
-async function getOrSetCache(key, ttlMs, fetchFn) {
-    const cached = cacheGet(key);
-    if (cached !== undefined) return cached;
-    const fresh = await fetchFn();
-    return cacheSet(key, fresh, ttlMs);
+async function getUptimeHistory() {
+    return getOrSetCache('uptime-history', CACHE_TTL.UPTIME_HISTORY, async () => {
+        const snapshot = await rtdb.ref(UPTIME_DAILY_PATH).once('value');
+        const data = snapshot.val() || {};
+        return Object.keys(data)
+            .sort()
+            .slice(-30)
+            .map(date => ({ date, seconds: Number(data[date]) || 0 }));
+    });
 }
 
-const CACHE_TTL = {
-    PRODUCTS_JSON: 30 * 1000, // products.json remoto usado por /p/:id
-    REMOTE_ORDERS: 8 * 1000   // my_data.json remoto usado por compareLocalAndRemoteData
+function summarizeMonthUptime(history, timeZone) {
+    const todayKey = todayKeyInTimeZone(timeZone);
+    const monthPrefix = todayKey.slice(0, 7);
+    const totalSeconds = history
+        .filter(day => day.date.startsWith(monthPrefix))
+        .reduce((sum, day) => sum + day.seconds, 0);
+    const dayOfMonth = Number(todayKey.slice(8, 10)) || 1;
+    const possibleSeconds = dayOfMonth * 86400;
+    const percent = possibleSeconds > 0 ? Math.min(100, (totalSeconds / possibleSeconds) * 100) : 0;
+    return { totalSeconds, percent: Number(percent.toFixed(2)) };
+}
+
+const RENDER_API_BASE = 'https://api.render.com/v1';
+const RENDER_SERVICE_ID = process.env.RENDER_SERVICE_ID;
+const RENDER_API_KEY = process.env.RENDER_API_KEY;
+
+function renderConfigured() {
+    return Boolean(RENDER_API_KEY && RENDER_SERVICE_ID);
+}
+
+async function renderApiRequest(path, params) {
+    const url = new URL(`${RENDER_API_BASE}${path}`);
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value === undefined || value === null) return;
+        if (Array.isArray(value)) {
+            value.forEach(v => url.searchParams.append(key, v));
+        } else {
+            url.searchParams.set(key, value);
+        }
+    });
+    const response = await fetch(url.toString(), {
+        headers: {
+            Authorization: `Bearer ${RENDER_API_KEY}`,
+            Accept: 'application/json'
+        }
+    });
+    if (!response.ok) {
+        const bodyText = await response.text().catch(() => '');
+        throw new Error(`Render API respondió ${response.status} en ${path}: ${bodyText.slice(0, 200)}`);
+    }
+    return response.json();
+}
+
+function normalizeRenderSeries(raw) {
+    if (!Array.isArray(raw)) return [];
+    const collected = [];
+    raw.forEach(entry => {
+        if (entry && Array.isArray(entry.values)) {
+            entry.values.forEach(point => collected.push(point));
+        } else if (entry && (entry.timestamp || entry.time)) {
+            collected.push(entry);
+        }
+    });
+    const source = collected.length > 0 ? collected : raw;
+    return source
+        .map(point => ({ timestamp: point.timestamp || point.time, value: Number(point.value) }))
+        .filter(point => Number.isFinite(point.value));
+}
+
+const RENDER_BANDWIDTH_SOURCE_MAP = {
+    http: 'http', httpresponses: 'http', 'http responses': 'http', 'http response': 'http',
+    websocket: 'websocket', 'websocket responses': 'websocket', 'websocket response': 'websocket',
+    serviceinitiated: 'serviceInitiated', 'service-initiated': 'serviceInitiated', 'service initiated': 'serviceInitiated', nat: 'serviceInitiated',
+    privatelink: 'privateLink', 'service-initiated (private link)': 'privateLink', 'private link': 'privateLink', privatelinktraffic: 'privateLink'
 };
 
-// Cabecera Cache-Control estándar para endpoints públicos de solo lectura.
-// stale-while-revalidate deja que el navegador siga usando la respuesta
-// vieja mientras revalida en segundo plano, sin bloquear al usuario.
-function setPublicCacheHeaders(res, maxAgeSec = 5, swrSec = 30) {
-    res.set('Cache-Control', `public, max-age=${maxAgeSec}, s-maxage=${maxAgeSec}, stale-while-revalidate=${swrSec}`);
+function normalizeBandwidthSources(raw) {
+    const buckets = { http: [], websocket: [], serviceInitiated: [], privateLink: [] };
+    if (!Array.isArray(raw)) return buckets;
+    raw.forEach(entry => {
+        const values = Array.isArray(entry && entry.values) ? entry.values : (entry ? [entry] : []);
+        const rawSource = String((entry && (entry.source || entry.trafficSource || entry.type || entry.category)) || '').trim().toLowerCase();
+        const bucketKey = RENDER_BANDWIDTH_SOURCE_MAP[rawSource];
+        if (!bucketKey) return;
+        values.forEach(point => {
+            const value = Number(point.value);
+            if (!Number.isFinite(value)) return;
+            buckets[bucketKey].push({ timestamp: point.timestamp || point.time, value });
+        });
+    });
+    return buckets;
 }
 
-// Configuración de CORS
-const allowedOrigins = [
-    "https://casa-fresca.onrender.com",
-    "https://backend-casafresca.onrender.com",
-    "https://analytics-casafresca.onrender.com",
-    "https://casa-fresca.support-casafresca.workers.dev", // Frontend en Cloudflare Workers
-    "http://127.0.0.1:5500",
-    "http://localhost:10000",
-    'https://localhost',                      // Capacitor Android
-    'capacitor://localhost',                  // Capacitor iOS
-    'http://localhost',                       // Pruebas en navegador
-    'http://localhost:8100',                   // Ionic Dev Server
-    "http://localhost:5500"
-];
+function normalizeHttpRequests(raw) {
+    if (!Array.isArray(raw)) return [];
+    const collected = [];
+    raw.forEach(entry => {
+        const label = entry && (entry.statusCode || entry.status_code || entry.host || entry.label);
+        const values = Array.isArray(entry && entry.values) ? entry.values : (entry ? [entry] : []);
+        values.forEach(point => {
+            const value = Number(point.value);
+            if (!Number.isFinite(value)) return;
+            collected.push({ timestamp: point.timestamp || point.time, value, label: label !== undefined ? String(label) : undefined });
+        });
+    });
+    return collected;
+}
 
-// Render (y la mayoría de PaaS) terminan el HTTPS en un proxy y le hablan a
-// tu app por HTTP puro internamente. Sin esto, Express no detecta bien la
-// IP real del cliente detrás del proxy.
-app.set('trust proxy', 1);
+async function getRenderMetricsSummary() {
+    if (!renderConfigured()) {
+        return { available: false, reason: 'not_configured' };
+    }
+    return getOrSetCache('render-metrics', CACHE_TTL.RENDER_METRICS, async () => {
+        const endTime = new Date();
+        const startTime = new Date(endTime.getTime() - 24 * 60 * 60 * 1000);
+        const baseParams = { resource: RENDER_SERVICE_ID, startTime: startTime.toISOString(), endTime: endTime.toISOString() };
+        try {
+            const [cpuRaw, memoryRaw, bandwidthRaw, bandwidthSourcesRaw, httpRequestsRaw] = await Promise.all([
+                renderApiRequest('/metrics/cpu', baseParams),
+                renderApiRequest('/metrics/memory', baseParams),
+                renderApiRequest('/metrics/bandwidth', baseParams),
+                renderApiRequest('/metrics/bandwidth-sources', baseParams).catch(err => { addLog(`WARN: bandwidth-sources no disponible: ${err.message}`); return []; }),
+                renderApiRequest('/metrics/http-requests', Object.assign({}, baseParams, { aggregateBy: 'statusCode' })).catch(err => { addLog(`WARN: http-requests no disponible: ${err.message}`); return []; })
+            ]);
+            return {
+                available: true,
+                cpu: normalizeRenderSeries(cpuRaw),
+                memory: normalizeRenderSeries(memoryRaw),
+                bandwidth: normalizeRenderSeries(bandwidthRaw),
+                bandwidthSources: normalizeBandwidthSources(bandwidthSourcesRaw),
+                httpRequests: normalizeHttpRequests(httpRequestsRaw),
+                updatedAt: new Date().toISOString()
+            };
+        } catch (err) {
+            addLog(`WARN: No se pudieron obtener métricas de Render: ${err.message}`);
+            return { available: false, reason: 'fetch_error', message: err.message };
+        }
+    });
+}
+
+function normalizeRenderCommit(commit) {
+    if (!commit) return null;
+    const id = commit.id || commit.sha || null;
+    return {
+        id,
+        shortId: id ? String(id).slice(0, 7) : null,
+        message: commit.message || commit.messageHeadline || null,
+        createdAt: commit.createdAt || commit.committedAt || null
+    };
+}
+
+function normalizeRenderDeploy(entry) {
+    const deploy = (entry && entry.deploy) || entry || {};
+    return {
+        id: deploy.id || null,
+        status: deploy.status || null,
+        trigger: deploy.trigger || null,
+        createdAt: deploy.createdAt || null,
+        updatedAt: deploy.updatedAt || null,
+        finishedAt: deploy.finishedAt || null,
+        commit: normalizeRenderCommit(deploy.commit)
+    };
+}
+
+async function getRenderDeploysList() {
+    if (!renderConfigured()) return { available: false, reason: 'not_configured' };
+    return getOrSetCache('render-deploys', CACHE_TTL.RENDER_DEPLOYS, async () => {
+        try {
+            const raw = await renderApiRequest(`/services/${RENDER_SERVICE_ID}/deploys`, { limit: 15 });
+            const list = Array.isArray(raw) ? raw : [];
+            return { available: true, deploys: list.map(normalizeRenderDeploy), updatedAt: new Date().toISOString() };
+        } catch (err) {
+            addLog(`WARN: No se pudieron obtener deploys de Render: ${err.message}`);
+            return { available: false, reason: 'fetch_error', message: err.message };
+        }
+    });
+}
+
+function normalizeRenderEvent(entry) {
+    const event = (entry && entry.event) || entry || {};
+    return {
+        id: event.id || null,
+        type: event.type || null,
+        timestamp: event.timestamp || event.createdAt || null,
+        details: event.details || {}
+    };
+}
+
+async function getRenderEventsList() {
+    if (!renderConfigured()) return { available: false, reason: 'not_configured' };
+    return getOrSetCache('render-events', CACHE_TTL.RENDER_EVENTS, async () => {
+        try {
+            const raw = await renderApiRequest(`/services/${RENDER_SERVICE_ID}/events`, { limit: 30 });
+            const list = Array.isArray(raw) ? raw : [];
+            return { available: true, events: list.map(normalizeRenderEvent), updatedAt: new Date().toISOString() };
+        } catch (err) {
+            addLog(`WARN: No se pudieron obtener eventos de Render: ${err.message}`);
+            return { available: false, reason: 'fetch_error', message: err.message };
+        }
+    });
+}
+
+async function getRenderServiceInfo() {
+    if (!renderConfigured()) return { available: false, reason: 'not_configured' };
+    return getOrSetCache('render-service', CACHE_TTL.RENDER_SERVICE, async () => {
+        try {
+            const service = await renderApiRequest(`/services/${RENDER_SERVICE_ID}`, {});
+            return {
+                available: true,
+                id: service.id,
+                name: service.name,
+                type: service.type,
+                repo: service.repo,
+                branch: service.branch,
+                autoDeploy: service.autoDeploy,
+                suspended: service.suspended,
+                plan: service.plan,
+                region: service.region,
+                url: service.url,
+                dashboardUrl: service.dashboardUrl || (service.id ? `https://dashboard.render.com/web/${service.id}` : null),
+                createdAt: service.createdAt,
+                updatedAt: service.updatedAt
+            };
+        } catch (err) {
+            addLog(`WARN: No se pudo obtener info del servicio de Render: ${err.message}`);
+            return { available: false, reason: 'fetch_error', message: err.message };
+        }
+    });
+}
+
+const SECONDARY_FIREBASE_APP_NAME = 'secondary-rtdb';
+const SECONDARY_FIREBASE_DATABASE_URL = process.env.FIREBASE_SECOND_DATABASE_URL;
+
+function loadSecondaryServiceAccountFromEnv() {
+    const raw = process.env.FIREBASE_SECOND_SERVICE_ACCOUNT;
+    if (!raw) return null;
+    try {
+        return JSON.parse(raw);
+    } catch (error) {
+        console.error('ERROR: FIREBASE_SECOND_SERVICE_ACCOUNT no es un JSON válido:', error.message);
+        return null;
+    }
+}
+
+const secondaryServiceAccount = loadSecondaryServiceAccountFromEnv();
+if (!secondaryServiceAccount || !SECONDARY_FIREBASE_DATABASE_URL) {
+    throw new Error('Faltan FIREBASE_SECOND_SERVICE_ACCOUNT o FIREBASE_SECOND_DATABASE_URL.');
+}
+let secondaryRtdb = null;
+
+if (secondaryServiceAccount) {
+    admin.initializeApp({
+        credential: admin.credential.cert(secondaryServiceAccount),
+        databaseURL: SECONDARY_FIREBASE_DATABASE_URL
+    }, SECONDARY_FIREBASE_APP_NAME);
+    secondaryRtdb = admin.app(SECONDARY_FIREBASE_APP_NAME).database();
+    addLog('Instancia secundaria de Firebase RTDB inicializada correctamente.');
+} else {
+    console.warn('WARN: No se encontró la segunda instancia de Firebase RTDB. Los nuevos endpoints de pedidos y productos devolverán 503 hasta configurar FIREBASE_SECOND_SERVICE_ACCOUNT y FIREBASE_SECOND_DATABASE_URL.');
+}
+
+async function readSecondaryCollection(refPath, defaultValue = []) {
+    if (!secondaryRtdb) {
+        return Array.isArray(defaultValue) ? [...defaultValue] : defaultValue;
+    }
+
+    const snapshot = await secondaryRtdb.ref(refPath).once('value');
+    const data = snapshot.val();
+
+    if (Array.isArray(data)) {
+        return data;
+    }
+
+    if (data && typeof data === 'object') {
+        return Object.values(data);
+    }
+
+    return Array.isArray(defaultValue) ? [...defaultValue] : defaultValue;
+}
+
+async function writeSecondaryCollection(refPath, payload) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    await secondaryRtdb.ref(refPath).set(payload);
+}
+
+async function readSecondaryNode(refPath, defaultValue = []) {
+    if (!secondaryRtdb) {
+        return Array.isArray(defaultValue) ? [...defaultValue] : defaultValue;
+    }
+
+    const snapshot = await secondaryRtdb.ref(refPath).once('value');
+    const data = snapshot.val();
+    return data === null || data === undefined ? defaultValue : data;
+}
+
+async function writeSecondaryNode(refPath, payload) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    await secondaryRtdb.ref(refPath).set(payload);
+}
+
+// -----------------------------------------------------------------------------
+// Nueva arquitectura de ramas en la RTDB secundaria (datos-buquenque):
+//   /estadisticas      -> SOLO stats de visitas (sin "compras" ni datos de
+//                          comprador/envío, que en una visita sin compra
+//                          siempre llegan vacíos)
+//   /pedidos           -> pedidos completos (con "compras") creados desde /guardar-estadistica
+//   /pedidos_asignados -> registro DELGADO por pedido en seguimiento: solo
+//                          pedido_origen_id (referencia al pedido en
+//                          /pedidos) + los campos nuevos del seguimiento
+//                          (aceptado, entregado, pendiente_pago, pagado,
+//                          estado, fecha_asignacion, usuarioReincidente).
+//                          Ya NO es una copia completa del pedido; los
+//                          endpoints la reconstruyen al leer, uniendo con
+//                          /pedidos (ver hidratarPedidoAsignado más abajo).
+// -----------------------------------------------------------------------------
+const ESTADISTICAS_RTDB_PATH = 'estadisticas';
+const PEDIDOS_RTDB_PATH = 'pedidos';
+const PEDIDOS_ASIGNADOS_RTDB_PATH = 'pedidos_asignados';
+const STATS_SUMMARY_RTDB_PATH = 'stats_summary';
+const STATS_SUMMARY_META_RTDB_PATH = 'stats_summary_meta';
+const STATS_SUMMARY_IPS_RTDB_PATH = 'stats_summary_ips';
+let statsSummaryReady = false;
+let statsSummaryInitializationPromise = null;
+
+function statsSummaryCurrentMonth(){
+    return nowInTimeZone('America/Havana').slice(0, 7);
+}
+
+function statsSummaryIpKey(ip){
+    return crypto.createHash('sha256').update(String(ip)).digest('hex');
+}
+
+async function ensureStatisticsSummary(){
+    if (statsSummaryReady) return;
+    if (statsSummaryInitializationPromise) return statsSummaryInitializationPromise;
+
+    statsSummaryInitializationPromise = (async () => {
+        if (!secondaryRtdb) throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+        const metaRef = secondaryRtdb.ref(STATS_SUMMARY_META_RTDB_PATH);
+        const owner = crypto.randomUUID();
+        const leaseMs = 2 * 60 * 1000;
+
+        for (let attempt = 0; attempt < 240; attempt++){
+            const now = Date.now();
+            const claim = await metaRef.transaction(current => {
+                if (current && current.initialized && !current.needsRebuild) return;
+                if (current && current.owner && now - Number(current.startedAt || 0) < leaseMs) return;
+                return { owner, startedAt: now, initialized: false };
+            });
+            if (!claim.committed){
+                const current = claim.snapshot && claim.snapshot.val();
+                if (current && current.initialized && !current.needsRebuild){
+                    statsSummaryReady = true;
+                    return;
+                }
+                await new Promise(resolve => setTimeout(resolve, 250));
+                continue;
+            }
+
+            try {
+                const statsSnapshot = await secondaryRtdb.ref(ESTADISTICAS_RTDB_PATH).once('value');
+                const statsTree = statsSnapshot.val() || {};
+                const records = Object.entries(statsTree)
+                    .filter(([, record]) => record && typeof record === 'object')
+                    .map(([id, record]) => ({ id, ...record }));
+                const monthPrefix = statsSummaryCurrentMonth();
+                const summary = buildSummaryFromRecords(records, monthPrefix);
+                const knownStatsIps = {};
+                records.forEach(record => {
+                    const ip = String(record.ip || '');
+                    if (ip) knownStatsIps[statsSummaryIpKey(ip)] = true;
+                });
+                await secondaryRtdb.ref().update({
+                    [STATS_SUMMARY_RTDB_PATH]: summary,
+                    [STATS_SUMMARY_IPS_RTDB_PATH]: knownStatsIps,
+                    [STATS_SUMMARY_META_RTDB_PATH]: { initialized: true, builtAt: Date.now() },
+                });
+                const backfillMessage = `Resumen incremental de visitas inicializado desde ${records.length} registros (${Buffer.byteLength(JSON.stringify(statsTree), 'utf8')} bytes de backfill).`;
+                addLog(backfillMessage);
+                console.info(backfillMessage);
+                statsSummaryReady = true;
+                cacheDel('stats:summary');
+                return;
+            } catch (error) {
+                await metaRef.transaction(current => current && current.owner === owner ? null : current).catch(() => {});
+                throw error;
+            }
+        }
+        throw new Error('Timeout esperando la inicialización del resumen de visitas.');
+    })();
+
+    try {
+        await statsSummaryInitializationPromise;
+    } finally {
+        statsSummaryInitializationPromise = null;
+    }
+}
+
+async function listUserStatisticsFromSecondary() {
+    // Evita releer el histórico completo para cada consulta del panel.
+    return await listSecondaryPushCollection(ESTADISTICAS_RTDB_PATH, CACHE_TTL.STATS);
+}
+
+async function addUserStatisticRecord(record) {
+    // Ojo: NO invalidamos la caché de /estadisticas en cada visita. El nodo
+    // cambia constantemente (cada visita), así que invalidarlo provocaría una
+    // descarga completa del histórico cada vez que alguien abre el panel.
+    // El TTL de una hora mantiene acotadas las descargas del histórico.
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    await ensureStatisticsSummary();
+    const ref = secondaryRtdb.ref(ESTADISTICAS_RTDB_PATH).push();
+    await ref.set(record);
+    try {
+        const ip = String(record.ip || '');
+        let firstVisitFromIp = false;
+        if (ip){
+            const ipRef = secondaryRtdb.ref(`${STATS_SUMMARY_IPS_RTDB_PATH}/${statsSummaryIpKey(ip)}`);
+            const claim = await ipRef.transaction(current => current === true ? undefined : true);
+            firstVisitFromIp = Boolean(claim && claim.committed);
+        }
+        await secondaryRtdb.ref(STATS_SUMMARY_RTDB_PATH).transaction(current =>
+            addStatsSummaryRecord(current, record, firstVisitFromIp, statsSummaryCurrentMonth())
+        );
+        cacheDel('stats:summary');
+    } catch (error) {
+        statsSummaryReady = false;
+        await secondaryRtdb.ref(STATS_SUMMARY_META_RTDB_PATH).update({ initialized: false, needsRebuild: true }).catch(() => {});
+        addLog(`WARN: se marcó el resumen de visitas para reconstrucción tras fallar un incremento: ${error.message}`);
+    }
+    return ref.key;
+}
+
+async function clearUserStatistics() {
+    const monthPrefix = statsSummaryCurrentMonth();
+    await secondaryRtdb.ref().update({
+        [ESTADISTICAS_RTDB_PATH]: null,
+        [STATS_SUMMARY_RTDB_PATH]: createEmptySummary(monthPrefix),
+        [STATS_SUMMARY_IPS_RTDB_PATH]: null,
+        [STATS_SUMMARY_META_RTDB_PATH]: { initialized: true, builtAt: Date.now() },
+    });
+    statsSummaryReady = true;
+    cacheDel(pushListCacheKey(ESTADISTICAS_RTDB_PATH));
+    cacheDel('stats:summary');
+}
+
+const KNOWN_IPS_RTDB_PATH = 'known_ips';
+
+async function isKnownIp(ip) {
+    if (!secondaryRtdb || !ip) return false;
+    const safeIp = String(ip).replace(/[.#$/\[\]]/g, '_');
+    const snapshot = await secondaryRtdb.ref(`${KNOWN_IPS_RTDB_PATH}/${safeIp}`).once('value');
+    return snapshot.val() === true;
+}
+
+async function markKnownIp(ip) {
+    if (!secondaryRtdb || !ip) return;
+    const safeIp = String(ip).replace(/[.#$/\[\]]/g, '_');
+    await secondaryRtdb.ref(`${KNOWN_IPS_RTDB_PATH}/${safeIp}`).set(true);
+}
+
+// clearKnownIps() se eliminó a propósito: /known_ips NO forma parte del
+// registro de estadísticas (sirve para clasificar visitas como Recurrente/Único)
+// y borrarlo reiniciaba esa clasificación al limpiar /estadisticas. Si alguna
+// vez hace falta, el nodo se puede vaciar a mano desde la consola de Firebase.
+
+// Helpers genéricos para colecciones basadas en push-id (objeto { id: valor })
+// usadas por /pedidos, /pedidos_asignados y /estadisticas, para poder hacer
+// CRUD por id. La lectura de la colección completa se cachea brevemente
+// (PUSH_LIST) porque el panel de gestión puede pedirla varias veces seguidas
+// (Resumen, Pedidos, Usuarios, checkUsuarioReincidente) y crece sin límite.
+function pushListCacheKey(refPath) {
+    return `pushlist:${refPath}`;
+}
+
+async function listSecondaryPushCollection(refPath, ttlMs = CACHE_TTL.PUSH_LIST) {
+    if (!secondaryRtdb) return [];
+    return getOrSetCache(pushListCacheKey(refPath), ttlMs, async () => {
+        const snapshot = await secondaryRtdb.ref(refPath).once('value');
+        const data = snapshot.val();
+        const bytes = Buffer.byteLength(JSON.stringify(data ?? null), 'utf8');
+        const message = `RTDB2 lectura completa ${refPath}: ${bytes} bytes`;
+        addLog(message);
+        console.info(message);
+        if (!data || typeof data !== 'object') return [];
+        return Object.entries(data).map(([id, value]) => ({ id, ...value }));
+    });
+}
+
+// Invalidación cruzada: /pedidos_asignados se hidrata con /pedidos, así que
+// cualquier escritura en una de las dos invalida también la lista hidratada.
+function invalidatePedidosCaches() {
+    cacheDel(pushListCacheKey(PEDIDOS_RTDB_PATH));
+    cacheDel(pushListCacheKey(PEDIDOS_ASIGNADOS_RTDB_PATH));
+    cacheDel('pushlist:pedidos_asignados_hidratados');
+    cacheDel('panel:pedidos');
+}
+
+function invalidatePushCollection(refPath) {
+    cacheDel(pushListCacheKey(refPath));
+    if (refPath === PEDIDOS_RTDB_PATH || refPath === PEDIDOS_ASIGNADOS_RTDB_PATH) {
+        invalidatePedidosCaches();
+    }
+}
+
+async function getSecondaryPushRecord(refPath, id) {
+    if (!secondaryRtdb) return null;
+    const snapshot = await secondaryRtdb.ref(`${refPath}/${id}`).once('value');
+    const data = snapshot.val();
+    if (!data) return null;
+    return { id, ...data };
+}
+
+async function addSecondaryPushRecord(refPath, value) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    const ref = await secondaryRtdb.ref(refPath).push(value);
+    invalidatePushCollection(refPath);
+    return ref.key;
+}
+
+async function updateSecondaryPushRecord(refPath, id, patch) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    await secondaryRtdb.ref(`${refPath}/${id}`).update(patch);
+    invalidatePushCollection(refPath);
+    return await getSecondaryPushRecord(refPath, id);
+}
+
+async function deleteSecondaryPushRecord(refPath, id) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    await secondaryRtdb.ref(`${refPath}/${id}`).remove();
+    invalidatePushCollection(refPath);
+}
+
+async function claimClientOrderId(clientOrderId, pedidoId) {
+    if (!secondaryRtdb || !clientOrderId) return { isNew: true };
+    try {
+        const ref = secondaryRtdb.ref(`client_order_index/${clientOrderId}`);
+        const txResult = await ref.transaction(current => {
+            if (current) return;
+            return pedidoId;
+        });
+        if (txResult && txResult.committed) {
+            return { isNew: true };
+        }
+        const existingPedidoId = txResult && txResult.snapshot ? txResult.snapshot.val() : null;
+        return { isNew: false, pedidoId: existingPedidoId };
+    } catch (err) {
+        addLog(`ERROR: claimClientOrderId falló para ${clientOrderId}: ${err && err.message ? err.message : err}`);
+        return { isNew: true };
+    }
+}
+
+async function claimPedidoStockDecrement(refPath, id) {
+    if (!secondaryRtdb || !id) return false;
+    try {
+        const txResult = await secondaryRtdb.ref(`${refPath}/${id}/stock_decrementado`).transaction(current => {
+            if (current === true) return;
+            return true;
+        });
+        return Boolean(txResult && txResult.committed);
+    } catch (err) {
+        addLog(`ERROR: transacción de reclamo stock_decrementado falló para ${id}: ${err && err.message ? err.message : err}`);
+        return false;
+    }
+}
+
+async function allocateNextOrderNumber() {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+
+    const counterRef = secondaryRtdb.ref('order_counter/lastNumber');
+    const transactionResult = await counterRef.transaction(current => {
+        const currentValue = Number(current);
+        if (Number.isNaN(currentValue) || currentValue < 0) {
+            return 1;
+        }
+        return currentValue + 1;
+    });
+
+    if (!transactionResult.committed) {
+        throw new Error('No se pudo generar el número de orden.');
+    }
+
+    const nextNumber = Number(transactionResult.snapshot.val() || 0);
+    return `BS-${String(nextNumber).padStart(2, '0')}`;
+}
+
+// Determina si un pedido pertenece al mismo usuario que otro, comparando por
+// teléfono, correo o un id explícito (lo que esté disponible en ambos).
+function ordersBelongToSameUser(a, b) {
+    if (!a || !b) return false;
+    const telA = String(a.telefono_comprador || '').trim();
+    const telB = String(b.telefono_comprador || '').trim();
+    if (telA && telB && telA === telB) return true;
+
+    const mailA = String(a.correo_comprador || '').trim().toLowerCase();
+    const mailB = String(b.correo_comprador || '').trim().toLowerCase();
+    if (mailA && mailA !== 'n/a' && mailA === mailB) return true;
+
+    const idA = a.usuarioId || a.userId || a.id_usuario;
+    const idB = b.usuarioId || b.userId || b.id_usuario;
+    if (idA && idB && String(idA) === String(idB)) return true;
+
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// /pedidos_asignados ahora es un registro DELGADO: solo guarda el id del
+// pedido de origen (pedido_origen_id) más los campos nuevos propios del
+// seguimiento (estado, fecha_asignacion, usuarioReincidente, etc). Ya NO es
+// una copia completa del pedido. Estos helpers "hidratan" un registro
+// delgado uniéndolo con su pedido original de /pedidos para reconstruir el
+// mismo shape completo que antes devolvían los endpoints (compras,
+// nombre_comprador, direccion_envio, etc), así ningún consumidor (panel de
+// analíticas, app Android) necesita cambios.
+// -----------------------------------------------------------------------------
+function hidratarPedidoAsignadoConOrigen(asignado, pedidoOrigen) {
+    if (!asignado) return null;
+    if (!pedidoOrigen) return { ...asignado };
+    const { id: _idOrigenIgnorado, ...datosOrigen } = pedidoOrigen;
+    const pedidoHidratado = { ...datosOrigen, ...asignado };
+    ['nombre_comprador', 'telefono_comprador', 'direccion_envio'].forEach(campo => {
+        if (datosOrigen[campo] !== undefined) pedidoHidratado[campo] = datosOrigen[campo];
+    });
+    return pedidoHidratado;
+}
+
+async function hidratarPedidoAsignado(asignado) {
+    if (!asignado) return null;
+    if (!asignado.pedido_origen_id) return asignado;
+    const pedidoOrigen = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, asignado.pedido_origen_id);
+    return hidratarPedidoAsignadoConOrigen(asignado, pedidoOrigen);
+}
+
+async function listarPedidosAsignadosHidratados() {
+    // La hidratación cruza dos colecciones y es cara: se cachea como una sola
+    // lista y se invalida cuando cambia /pedidos o /pedidos_asignados.
+    return getOrSetCache('pushlist:pedidos_asignados_hidratados', CACHE_TTL.PUSH_LIST, async () => {
+        const [asignados, pedidos] = await Promise.all([
+            listSecondaryPushCollection(PEDIDOS_ASIGNADOS_RTDB_PATH),
+            listSecondaryPushCollection(PEDIDOS_RTDB_PATH)
+        ]);
+        const pedidosPorId = new Map(pedidos.map(p => [p.id, p]));
+        return asignados.map(asignado => hidratarPedidoAsignadoConOrigen(asignado, pedidosPorId.get(asignado.pedido_origen_id)));
+    });
+}
+
+// -----------------------------------------------------------------------------
+// Proyección de pedidos para el panel.
+//   - stock_afectados solo se usa internamente (crear/eliminar); nunca se pinta
+//     en el panel y puede ocupar más que el propio pedido.
+//   - compact=1 reduce cada ítem de compras a los campos que el panel usa de
+//     verdad (id, nombre, cantidad, precio y tipo). El backend reconstruye el
+//     resto al guardar, así que editar desde el panel sigue siendo seguro.
+// -----------------------------------------------------------------------------
+function projectPedido(pedido, compact = false) {
+    if (!pedido || typeof pedido !== 'object') return pedido;
+    const salida = { ...pedido };
+    delete salida.stock_afectados;
+    if (compact && Array.isArray(salida.compras)) {
+        salida.compras = salida.compras.map(item => ({
+            id: item && item.id !== undefined ? item.id : null,
+            name: (item && (item.name || item.nombre)) || 'Producto',
+            quantity: Number(item && (item.quantity ?? item.cantidad ?? 1)) || 0,
+            unitPrice: Number(item && (item.unitPrice ?? item.precio ?? 0)) || 0,
+            listPrice: Number(item && (item.listPrice ?? item.unitPrice ?? item.precio ?? 0)) || 0,
+            discount: Number(item && item.discount) || 0,
+            type: (item && item.type) || (item && (item.isPack || item.pack) ? 'pack' : 'product')
+        }));
+    }
+    return salida;
+}
+
+async function getPanelPedidos() {
+    // Una sola entrada de caché para lo que piden juntos Resumen y Pedidos.
+    return getOrSetCache('panel:pedidos', CACHE_TTL.PUSH_LIST, async () => {
+        const [pedidos, pedidosAsignados] = await Promise.all([
+            listSecondaryPushCollection(PEDIDOS_RTDB_PATH),
+            listarPedidosAsignadosHidratados()
+        ]);
+        return { pedidos, pedidosAsignados };
+    });
+}
+
+// Revisa si el usuario dueño de "pedido" ya tiene compras anteriores
+// registradas en /pedidos o /pedidos_asignados (excluyendo el propio pedido).
+async function checkUsuarioReincidente(pedido, excludeId, excludeOrderNumber) {
+    const [pedidosPrevios, asignadosHidratados] = await Promise.all([
+        listSecondaryPushCollection(PEDIDOS_RTDB_PATH),
+        listarPedidosAsignadosHidratados()
+    ]);
+
+    const orderNumber = String(excludeOrderNumber || pedido.orderNumber || pedido.numero_orden || '').trim();
+    const historial = [...pedidosPrevios, ...asignadosHidratados]
+        .filter(item => item.id !== excludeId && item.pedido_origen_id !== excludeId)
+        .filter(item => !orderNumber || String(item.orderNumber || item.numero_orden || '').trim() !== orderNumber);
+    return historial.some(item => ordersBelongToSameUser(item, pedido));
+}
+
+async function deleteSecondaryNode(refPath) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    await secondaryRtdb.ref(refPath).remove();
+}
+
+function toBoolLoose(value) {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+        return value.toLowerCase() === 'true' || value === '1';
+    }
+    return Boolean(value);
+}
+
+function normalizarDiasNoNegativos(value) {
+    const dias = Number(value);
+    return Number.isFinite(dias) ? Math.min(365, Math.max(0, Math.floor(dias))) : 0;
+}
+
+function normalizeProductPayload(payload = {}) {
+    const imagenes = Array.isArray(payload.imagenes)
+        ? payload.imagenes
+        : (payload.imagenes ? [payload.imagenes] : []);
+
+    const disponible = payload.disponibilidad !== undefined
+        ? payload.disponibilidad !== false
+        : payload.activo !== false;
+
+    return {
+        id: payload.id || crypto.randomUUID(),
+        nombre: payload.nombre || 'Sin nombre',
+        descripcion: payload.descripcion || '',
+        precio: Number(payload.precio ?? 0),
+        categoria: payload.categoria || 'general',
+        stock: Number(payload.stock ?? 0),
+        cantidad_minima: Math.max(1, Math.floor(Number(payload.cantidad_minima ?? 1)) || 1),
+        plazo_reposicion_dias: normalizarDiasNoNegativos(payload.plazo_reposicion_dias),
+        stock_seguridad_dias: normalizarDiasNoNegativos(payload.stock_seguridad_dias),
+        aplicar_stock: toBoolLoose(payload.aplicar_stock),
+        oferta: toBoolLoose(payload.oferta),
+        descuento: Number(payload.descuento ?? 0),
+        imagenes,
+        activo: disponible,
+        disponibilidad: disponible,
+        mas_vendido: toBoolLoose(payload.mas_vendido),
+        fecha_creacion: payload.fecha_creacion || nowInTimeZone('America/Havana'),
+        fecha_actualizacion: nowInTimeZone('America/Havana')
+    };
+}
+
+function normalizarListaCompras(compras) {
+    if (Array.isArray(compras)) return compras;
+    if (compras && typeof compras === 'object') return Object.values(compras);
+    return [];
+}
+
+function normalizeIdComparable(value) {
+    return String(value ?? '').trim().toLowerCase();
+}
+
+function extraerCantidadDeCompra(item) {
+    return Number(item.quantity ?? item.cantidad ?? item.qty ?? 1) || 0;
+}
+
+function extraerPosiblesIdsDeCompra(item) {
+    const fuentes = [
+        item.id, item.productId, item.product_id, item.productoId, item.producto_id,
+        item.idProducto, item.id_producto, item.itemId, item.item_id, item.uuid,
+        item.sku, item.codigo, item.code,
+        item.producto && item.producto.id, item.product && item.product.id
+    ];
+    const vistos = new Set();
+    const resultado = [];
+    fuentes.forEach(v => {
+        if (v === undefined || v === null) return;
+        const str = String(v).trim();
+        if (str === '' || vistos.has(str)) return;
+        vistos.add(str);
+        resultado.push(v);
+    });
+    return resultado;
+}
+
+function resolverProductoDesdeCompra(item, productMap) {
+    const posiblesIds = extraerPosiblesIdsDeCompra(item);
+    if (posiblesIds.length === 0) return null;
+
+    for (const posibleId of posiblesIds) {
+        if (productMap[posibleId] !== undefined) {
+            return { key: String(posibleId), producto: productMap[posibleId] };
+        }
+    }
+
+    const posiblesIdsNormalizados = posiblesIds.map(normalizeIdComparable);
+    const matchEntry = Object.entries(productMap).find(([key, p]) => {
+        if (!p) return false;
+        const idProducto = normalizeIdComparable(p.id);
+        const idClave = normalizeIdComparable(key);
+        return (idProducto !== '' && posiblesIdsNormalizados.includes(idProducto))
+            || (idClave !== '' && posiblesIdsNormalizados.includes(idClave));
+    });
+
+    if (matchEntry) {
+        addLog(`WARN: resolverProductoDesdeCompra emparejó por coincidencia flexible (no por clave exacta). IDs recibidos: ${JSON.stringify(posiblesIds)} -> producto resuelto: ${matchEntry[0]} (${matchEntry[1] && matchEntry[1].nombre}). Revisar si es el producto correcto.`);
+    }
+
+    return matchEntry ? { key: matchEntry[0], producto: matchEntry[1] } : null;
+}
+
+async function descontarStockPorCompras(comprasInput) {
+    const compras = normalizarListaCompras(comprasInput);
+    if (compras.length === 0) {
+        return { actualizado: false, exitoso: true, afectados: [], omitidos: [], noEncontrados: [], fallidos: [], sinStock: [] };
+    }
+    const snapshot = await rtdb.ref('products').once('value');
+    const productMap = snapshot.val() || {};
+
+    let huboCambios = false;
+    const afectados = [];
+    const omitidos = [];
+    const noEncontrados = [];
+    const fallidos = [];
+    const sinStock = [];
+
+    for (const item of compras) {
+        if (!item) continue;
+        const cantidad = extraerCantidadDeCompra(item);
+        if (cantidad <= 0) continue;
+
+        if (item.type === 'pack' || item.isPack === true || item.pack) {
+            omitidos.push({ id: item.id || null, motivo: 'pack_no_aplica_stock' });
+            continue;
+        }
+
+        const resuelto = resolverProductoDesdeCompra(item, productMap);
+        if (!resuelto) {
+            noEncontrados.push({ item, motivo: 'producto_no_encontrado_por_id' });
+            addLog(`ERROR: descontarStockPorCompras no pudo resolver el producto por ID. Item recibido: ${JSON.stringify(item)}. Claves disponibles en products: ${Object.keys(productMap).length}`);
+            continue;
+        }
+
+        const key = resuelto.key;
+
+        try {
+            const prodRef = rtdb.ref(`products/${key}`);
+            const now = nowInTimeZone('America/Havana');
+            let stockAnteriorCapturado = null;
+            let seModifico = false;
+            let noAplicaStock = false;
+            let stockInsuficiente = false;
+            let stockDisponibleCapturado = null;
+
+            const txResult = await prodRef.transaction(current => {
+                if (!current) return current;
+                if (!current.aplicar_stock) {
+                    noAplicaStock = true;
+                    return current;
+                }
+
+                const stockActual = Number(current.stock ?? 0);
+                stockAnteriorCapturado = stockActual;
+
+                if (stockActual < cantidad) {
+                    stockInsuficiente = true;
+                    stockDisponibleCapturado = stockActual;
+                    return;
+                }
+
+                const stockNuevo = stockActual - cantidad;
+                if (stockNuevo === stockActual) return current;
+
+                const actualizado = { ...current, stock: stockNuevo, fecha_actualizacion: now };
+                if (stockNuevo === 0) {
+                    actualizado.disponibilidad = false;
+                    actualizado.activo = false;
+                    actualizado.desactivado_por_stock = true;
+                    actualizado.fecha_desactivacion_stock = now;
+                }
+                seModifico = true;
+                return actualizado;
+            });
+
+            if (txResult && txResult.committed && seModifico) {
+                const after = txResult.snapshot && txResult.snapshot.val();
+                huboCambios = true;
+                const stockFinal = Number((after && after.stock) ?? 0);
+                afectados.push({
+                    id: (after && after.id) || key,
+                    nombre: (after && after.nombre) || key,
+                    stockAnterior: stockAnteriorCapturado,
+                    stockNuevo: stockFinal
+                });
+                const nombreProducto = (after && after.nombre) || key;
+                const motivoDesactivacion = stockFinal === 0
+                    ? ` ⚠ Producto "${nombreProducto}" (${key}) desactivado automáticamente por quedarse sin stock.`
+                    : '';
+                addLog(`Stock descontado: producto ${key} (${cantidad} unidad(es)), ${stockAnteriorCapturado} -> ${stockFinal}.${motivoDesactivacion}`);
+            } else if (txResult && txResult.committed && noAplicaStock) {
+                omitidos.push({ id: key, motivo: 'aplicar_stock_desactivado' });
+            } else if (!txResult || !txResult.committed) {
+                if (stockInsuficiente) {
+                    const nombreProducto = (resuelto.producto && resuelto.producto.nombre) || key;
+                    sinStock.push({
+                        id: (resuelto.producto && resuelto.producto.id) || key,
+                        nombre: nombreProducto,
+                        solicitado: cantidad,
+                        disponible: stockDisponibleCapturado ?? 0
+                    });
+                    addLog(`STOCK INSUFICIENTE: producto ${key} (${nombreProducto}) solicitado ${cantidad}, disponible ${stockDisponibleCapturado ?? 0}.`);
+                } else {
+                    fallidos.push({ id: key, item, motivo: 'transaccion_no_confirmada' });
+                    addLog(`ERROR: la transacción de descuento de stock no se confirmó para el producto ${key}. Item: ${JSON.stringify(item)}`);
+                }
+            }
+        } catch (err) {
+            fallidos.push({ id: key, item, motivo: 'excepcion', detalle: err && err.message ? err.message : String(err) });
+            addLog(`ERROR: transacción de descuento de stock falló para el producto ${key}: ${err && err.message ? err.message : err}`);
+        }
+    }
+
+    const exitoso = noEncontrados.length === 0 && fallidos.length === 0 && sinStock.length === 0;
+    return { actualizado: huboCambios, exitoso, afectados, omitidos, noEncontrados, fallidos, sinStock };
+}
+
+// -----------------------------------------------------------------------------
+// Devolución de stock al descartar/cancelar un pedido.
+async function restaurarStockPorCompras(comprasInput) {
+    const compras = normalizarListaCompras(comprasInput);
+    if (compras.length === 0) {
+        return { actualizado: false, exitoso: true, afectados: [], omitidos: [], noEncontrados: [], fallidos: [] };
+    }
+
+    const snapshot = await rtdb.ref('products').once('value');
+    const productMap = snapshot.val() || {};
+
+    let huboCambios = false;
+    const afectados = [];
+    const omitidos = [];
+    const noEncontrados = [];
+    const fallidos = [];
+
+    for (const item of compras) {
+        if (!item) continue;
+        const cantidad = extraerCantidadDeCompra(item);
+        if (cantidad <= 0) continue;
+
+        if (item.type === 'pack' || item.isPack === true || item.pack) {
+            omitidos.push({ id: item.id || null, motivo: 'pack_no_aplica_stock' });
+            continue;
+        }
+
+        const resuelto = resolverProductoDesdeCompra(item, productMap);
+        if (!resuelto) {
+            noEncontrados.push({ item, motivo: 'producto_no_encontrado_por_id' });
+            addLog(`ERROR: restaurarStockPorCompras no pudo resolver el producto por ID. Item recibido: ${JSON.stringify(item)}`);
+            continue;
+        }
+
+        const key = resuelto.key;
+
+        try {
+            const prodRef = rtdb.ref(`products/${key}`);
+            const now = nowInTimeZone('America/Havana');
+            let seModifico = false;
+            let noAplicaStock = false;
+
+            const txResult = await prodRef.transaction(current => {
+                if (!current) return current;
+                if (!current.aplicar_stock) {
+                    noAplicaStock = true;
+                    return current;
+                }
+
+                const stockActual = Number(current.stock ?? 0);
+                const stockNuevo = stockActual + cantidad;
+
+                const actualizado = { ...current, stock: stockNuevo, fecha_actualizacion: now };
+                if (stockNuevo > 0 && current.disponibilidad === false && current.activo === false) {
+                    actualizado.disponibilidad = true;
+                    actualizado.activo = true;
+                    actualizado.desactivado_por_stock = false;
+                }
+                seModifico = true;
+                return actualizado;
+            });
+
+            if (txResult && txResult.committed && seModifico) {
+                const after = txResult.snapshot && txResult.snapshot.val();
+                if (after) {
+                    huboCambios = true;
+                    afectados.push({ id: after.id || key, nombre: after.nombre || key, stockNuevo: Number(after.stock ?? 0) });
+                    const reactivadoTxt = after.activo === true ? ' Producto reactivado automáticamente.' : '';
+                    addLog(`Stock restaurado: producto ${key} (+${cantidad} unidad(es)), nuevo stock ${Number(after.stock ?? 0)}.${reactivadoTxt}`);
+                }
+            } else if (txResult && txResult.committed && noAplicaStock) {
+                omitidos.push({ id: key, motivo: 'aplicar_stock_desactivado' });
+            } else if (!txResult || !txResult.committed) {
+                fallidos.push({ id: key, item, motivo: 'transaccion_no_confirmada' });
+                addLog(`ERROR: la transacción de restauración de stock no se confirmó para el producto ${key}. Item: ${JSON.stringify(item)}`);
+            }
+        } catch (err) {
+            fallidos.push({ id: key, item, motivo: 'excepcion', detalle: err && err.message ? err.message : String(err) });
+            addLog(`ERROR: transacción de restauración de stock falló para el producto ${key}: ${err && err.message ? err.message : err}`);
+        }
+    }
+
+    const exitoso = noEncontrados.length === 0 && fallidos.length === 0;
+    return { actualizado: huboCambios, exitoso, afectados, omitidos, noEncontrados, fallidos };
+}
+
+async function getSecondaryProductMap() {
+    return getOrSetCache('products', CACHE_TTL.CATALOG, async () => {
+        const snapshot = await rtdb.ref('products').once('value');
+        const map = snapshot.val();
+        return map && typeof map === 'object' ? map : {};
+    });
+}
+
+// -----------------------------------------------------------------------------
+function calcularPrecioAutoritativo(itemInventario) {
+    const precioBase = Math.max(0, Number(itemInventario.precio ?? 0)) || 0;
+    const tieneOferta = Boolean(itemInventario.oferta) && Number(itemInventario.descuento) > 0;
+    const precioFinal = tieneOferta
+        ? precioBase * (1 - Number(itemInventario.descuento) / 100)
+        : precioBase;
+    return Math.round(precioFinal * 100) / 100;
+}
+
+async function sanitizarComprasYTotal(comprasInput) {
+    const lista = normalizarListaCompras(comprasInput);
+    const productMap = await getSecondaryProductMap();
+    const packMap = await getPackMap();
+
+    const comprasSaneadas = [];
+    let total = 0;
+
+    for (const item of lista) {
+        if (!item) continue;
+        const cantidad = Math.max(0, Math.floor(Number(item.quantity ?? item.cantidad ?? 0)));
+        if (cantidad <= 0) continue;
+
+        const esPack = item.type === 'pack' || Boolean(item.isPack || item.pack);
+        const mapaBusqueda = esPack ? packMap : productMap;
+        const resuelto = resolverProductoDesdeCompra(item, mapaBusqueda);
+        const key = resuelto ? resuelto.key : null;
+        const itemInventario = resuelto ? resuelto.producto : null;
+
+        if (!resuelto) {
+            addLog(`WARN: sanitizarComprasYTotal no pudo resolver el ${esPack ? 'pack' : 'producto'} por ID. Item recibido: ${JSON.stringify(item)}`);
+        }
+
+        const nombreFinal = itemInventario && itemInventario.nombre
+            ? itemInventario.nombre
+            : String(item.name || item.nombre || 'Producto').trim() || 'Producto';
+
+        const precioUnitarioRedondeado = itemInventario
+            ? calcularPrecioAutoritativo(itemInventario)
+            : Math.round((Math.max(0, Number(item.unitPrice ?? item.precio ?? 0)) || 0) * 100) / 100;
+        const precioLista = itemInventario
+            ? Math.round((Math.max(0, Number(itemInventario.precio ?? 0)) || 0) * 100) / 100
+            : Math.round((Math.max(0, Number(item.listPrice ?? item.unitPrice ?? item.precio ?? 0)) || 0) * 100) / 100;
+        const descuentoPorcentaje = itemInventario && Boolean(itemInventario.oferta)
+            ? Math.max(0, Number(itemInventario.descuento) || 0)
+            : Math.max(0, Number(item.discount) || 0);
+
+        const cantidadMinima = (!esPack && itemInventario)
+            ? Math.max(1, Math.floor(Number(itemInventario.cantidad_minima ?? 1)) || 1)
+            : 1;
+        const cantidadFinal = Math.max(cantidad, cantidadMinima);
+
+        total += precioUnitarioRedondeado * cantidadFinal;
+
+        const posiblesIds = extraerPosiblesIdsDeCompra(item);
+        comprasSaneadas.push({
+            id: key || (posiblesIds[0] !== undefined ? posiblesIds[0] : null),
+            name: nombreFinal,
+            unitPrice: precioUnitarioRedondeado,
+            listPrice: precioLista,
+            discount: descuentoPorcentaje,
+            quantity: cantidadFinal,
+            type: esPack ? 'pack' : 'product'
+        });
+    }
+
+    return { compras: comprasSaneadas, total: Math.round(total * 100) / 100 };
+}
+
+async function persistSecondaryProductMap(productMap) {
+    const safeMap = productMap || {};
+    await rtdb.ref('products').set(safeMap);
+    // Refresca la caché con el valor recién escrito en vez de invalidarla:
+    // así la siguiente lectura no dispara otra ida a Firebase.
+    cacheSet('products', safeMap, CACHE_TTL.CATALOG);
+}
+
+function normalizePackPayload(payload = {}) {
+    const imagenes = Array.isArray(payload.imagenes)
+        ? payload.imagenes
+        : (payload.imagenes ? [payload.imagenes] : []);
+
+    // Los productos que componen el pack se guardan tal cual llegan
+    // (array de ids, o de objetos { id, cantidad }, según use el frontend).
+    const productos = Array.isArray(payload.productos)
+        ? payload.productos
+        : (payload.productos ? [payload.productos] : []);
+
+    // Lista de features/bullets del pack (una por línea en el panel).
+    const caracteristicas = Array.isArray(payload.caracteristicas)
+        ? payload.caracteristicas
+        : (payload.caracteristicas ? [payload.caracteristicas] : []);
+
+    return {
+        id: payload.id || crypto.randomUUID(),
+        nombre: payload.nombre || 'Sin nombre',
+        descripcion: payload.descripcion || '',
+        precio: Number(payload.precio ?? 0),
+        categoria: payload.categoria || 'general',
+        stock: Number(payload.stock ?? 0),
+        oferta: Boolean(payload.oferta),
+        descuento: Number(payload.descuento ?? 0),
+        imagenes,
+        imagen: imagenes[0] || '',
+        productos,
+        caracteristicas,
+        activo: payload.activo !== false,
+        disponible: payload.disponible !== false,
+        top: Boolean(payload.top),
+        nuevo: Boolean(payload.nuevo),
+        fecha_creacion: payload.fecha_creacion || nowInTimeZone('America/Havana'),
+        fecha_actualizacion: nowInTimeZone('America/Havana')
+    };
+}
+
+async function getPackMap() {
+    return getOrSetCache('packs', CACHE_TTL.CATALOG, async () => {
+        const snapshot = await rtdb.ref('packs').once('value');
+        const map = snapshot.val();
+        return map && typeof map === 'object' ? map : {};
+    });
+}
+
+async function persistPackMap(packMap) {
+    const safeMap = packMap || {};
+    await rtdb.ref('packs').set(safeMap);
+    cacheSet('packs', safeMap, CACHE_TTL.CATALOG);
+}
+
+function normalizeManagedOrderPayload(payload = {}) {
+    const fechaActual = nowInTimeZone('America/Havana');
+    return {
+        id: payload.id || crypto.randomUUID(),
+        nombre_cliente: String(payload.nombre_cliente || '').trim(),
+        pais: payload.pais ? String(payload.pais) : 'N/A',
+        telefono: String(payload.telefono || '').trim(),
+        precio_total: Number(payload.precio_total ?? 0),
+        aceptado: Boolean(payload.aceptado),
+        entregado: Boolean(payload.entregado),
+        enviado_a_pagar: Boolean(payload.enviado_a_pagar),
+        pagado: Boolean(payload.pagado),
+        enviado_grupo_pagos: Boolean(payload.enviado_grupo_pagos),
+        origen: payload.origen === 'new-order' ? 'new-order' : 'manual',
+        source_key: payload.origen === 'new-order' && payload.sourceKey ? buildOrderKey(payload.sourceKey) : null,
+        fecha_creacion: payload.fecha_creacion || fechaActual,
+        fecha_actualizacion: fechaActual
+    };
+}
+
+function toArrayPayload(payload) {
+    if (Array.isArray(payload)) return payload;
+    if (payload && typeof payload === 'object') return Object.values(payload);
+    return [];
+}
+
+function ordersBranchCacheKey(branch) {
+    return `orders:${branch}`;
+}
+
+async function listSecondaryOrdersByBranch(branch) {
+    if (!secondaryRtdb) {
+        return [];
+    }
+    // Antes esta lectura NO tenía caché: cada sondeo del panel bajaba el nodo
+    // orders/{branch} completo. Ahora se cachea y se invalida al escribir.
+    return getOrSetCache(ordersBranchCacheKey(branch), CACHE_TTL.ORDERS_BRANCH, async () => {
+        const snapshot = await secondaryRtdb.ref(`orders/${branch}`).once('value');
+        const data = snapshot.val() || [];
+        const bytes = Buffer.byteLength(JSON.stringify(data), 'utf8');
+        const message = `RTDB2 lectura completa orders/${branch}: ${bytes} bytes`;
+        addLog(message);
+        console.info(message);
+        return toArrayPayload(data);
+    });
+}
+
+async function writeSecondaryOrdersByBranch(branch, payload) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    const list = Array.isArray(payload) ? payload : [];
+    const byId = {};
+    list.forEach(item => {
+        if (item && item.id) byId[item.id] = item;
+    });
+    await secondaryRtdb.ref(`orders/${branch}`).set(byId);
+    cacheSet(ordersBranchCacheKey(branch), list, CACHE_TTL.ORDERS_BRANCH);
+}
+
+async function getSecondaryOrderById(branch, id) {
+    if (!secondaryRtdb) return null;
+    const snapshot = await secondaryRtdb.ref(`orders/${branch}/${id}`).once('value');
+    const data = snapshot.val();
+    return data ? { ...data, id } : null;
+}
+
+async function setSecondaryOrderById(branch, id, value) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    await secondaryRtdb.ref(`orders/${branch}/${id}`).set(value);
+    cacheDel(ordersBranchCacheKey(branch));
+}
+
+async function patchSecondaryOrderById(branch, id, patch) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    await secondaryRtdb.ref(`orders/${branch}/${id}`).update(patch);
+    cacheDel(ordersBranchCacheKey(branch));
+    return await getSecondaryOrderById(branch, id);
+}
+
+async function deleteSecondaryOrderById(branch, id) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    await secondaryRtdb.ref(`orders/${branch}/${id}`).remove();
+    cacheDel(ordersBranchCacheKey(branch));
+}
+
+async function upsertSecondaryOrderRecord(order) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    const existing = await getSecondaryOrderById('managed', order.id);
+    const merged = existing
+        ? { ...existing, ...order, fecha_actualizacion: nowInTimeZone('America/Havana') }
+        : order;
+    await setSecondaryOrderById('managed', order.id, merged);
+    return merged;
+}
 
 app.use(cors({
     origin: function (origin, callback) {
-        // Permitir peticiones sin origen (como aplicaciones móviles o curl)
-        if (!origin) return callback(null, true);
-        
-        if (allowedOrigins.indexOf(origin) === -1) {
-            const msg = 'El policy de CORS para este sitio no permite acceso desde el origen especificado.';
-            return callback(new Error(msg), false);
+        if (!origin || allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            callback(new Error("No permitido por CORS"));
         }
-        return callback(null, true);
     },
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-New-Orders'], // Importante incluir tus headers personalizados
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "If-None-Match"],
+    // Permite que el panel (en otro origen) lea el ETag y pueda revalidar
+    // listados con If-None-Match en vez de volver a descargarlos.
+    exposedHeaders: ["ETag", "X-Total-Count", "X-Pagination"],
     credentials: true
 }));
 
-// Compresión gzip/brotli de las respuestas (igual que en index.js): reduce
-// notablemente el tráfico transferido, sobre todo en /obtener-estadisticas
-// y /api/get-comparison, que pueden devolver JSON largos.
 app.use(compression());
 
-// Middleware para procesar JSON, con límite explícito para evitar payloads
-// descontrolados (antes no tenía límite definido).
-app.use(express.json({ limit: '5mb' }));
-app.use(express.urlencoded({ extended: true, limit: '5mb' }));
+// Middleware para procesar JSON y formularios con un límite mayor para
+// permitir subir imágenes comprimidas en base64 desde el panel.
+app.use(express.json({ limit: '20mb' }));
+app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 
-// Función maestra para enviar el push
-async function enviarNotificacionNuevoPedido(cantidad) {
-    const mensaje = {
-        notification: {
-            title: '¡Nuevo Pedido en Casa Fresca! 📦',
-            body: `Tienes ${cantidad} pedido(s) nuevo(s) por procesar.`,
-        },
-        // Usamos un 'topic' para no tener que manejar tokens individuales por ahora
-        topic: 'admin_pedidos', 
-        android: {
-            priority: 'high', // Esto es lo que despierta la app si está cerrada
-            notification: {
-                sound: 'default',
-                clickAction: 'FCM_PLUGIN_ACTIVITY',
-                icon: 'stock_ticker_update' 
-            }
-        }
-    };
+// Render (y la mayoría de PaaS) terminan el HTTPS en un proxy y le hablan a
+// tu app por HTTP puro internamente. Sin esto, Express no detecta que la
+// conexión es segura y las cookies con `secure: true` no se comportan bien.
+app.set('trust proxy', 1);
 
-    try {
-        await admin.messaging().send(mensaje);
-        addLog("Notificación Push enviada correctamente.");
-    } catch (error) {
-        addLog(`Error enviando Push: ${error.message}`);
-    }
+
+const ADMIN_AUTH_RTDB_PATH = 'admin_auth';
+const SESSION_SECRET = process.env.SESSION_SECRET;
+if (!SESSION_SECRET) {
+    throw new Error('Falta la variable de entorno SESSION_SECRET.');
 }
 
+app.use(session({
+    secret: SESSION_SECRET,
+    name: 'buquenque.sid',
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+        httpOnly: true,
+        secure: true,
+        sameSite: 'none',
+        maxAge: 1000 * 60 * 60 * 12 // 12 horas
+    }
+}));
+
+// ---------------------------------------------------------------------
+// AUTENTICACIÓN POR TOKEN (Authorization: Bearer ...) - stateless (HMAC)
+// No depende de memoria compartida entre instancias serverless.
+// ---------------------------------------------------------------------
+
+const TOKEN_TTL_MS = 1000 * 60 * 60 * 12;
+
+function base64UrlEncode(input) {
+    return Buffer.from(input).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function base64UrlDecode(input) {
+    input = input.replace(/-/g, '+').replace(/_/g, '/');
+    while (input.length % 4) input += '=';
+    return Buffer.from(input, 'base64').toString('utf8');
+}
+
+function signPayload(payloadStr) {
+    return crypto.createHmac('sha256', SESSION_SECRET).update(payloadStr).digest('hex');
+}
+
+function createAuthToken(username, tokenEpoch) {
+    const payload = { username, tokenEpoch, expires: Date.now() + TOKEN_TTL_MS };
+    const payloadStr = JSON.stringify(payload);
+    const payloadB64 = base64UrlEncode(payloadStr);
+    const signature = signPayload(payloadB64);
+    return `${payloadB64}.${signature}`;
+}
+
+// Async: valida firma + expiración y además que el token siga
+// perteneciendo al epoch vigente (se invalida al cambiar contraseña).
+async function getAuthFromToken(req) {
+    const header = req.headers['authorization'] || '';
+    const match = header.match(/^Bearer\s+(.+)$/i);
+    if (!match) return null;
+    const token = match[1];
+    const parts = token.split('.');
+    if (parts.length !== 2) return null;
+    const [payloadB64, signature] = parts;
+    const expectedSignature = signPayload(payloadB64);
+    if (signature.length !== expectedSignature.length) return null;
+    const sigMatches = crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expectedSignature));
+    if (!sigMatches) return null;
+    let payload;
+    try {
+        payload = JSON.parse(base64UrlDecode(payloadB64));
+    } catch (error) {
+        return null;
+    }
+    if (!payload || !payload.username || !payload.expires || payload.expires < Date.now()) return null;
+
+    const creds = await getAdminCredentialsCached();
+    if (!creds || creds.username !== payload.username) return null;
+    if (creds.tokenEpoch && payload.tokenEpoch !== creds.tokenEpoch) return null; // revocado por cambio de contraseña
+
+    return { token, username: payload.username };
+}
+
+function revokeAuthToken(req) {
+    // Revocación real ocurre al cambiar el epoch en setAdminCredentials;
+    // esta función queda solo por compatibilidad de llamadas existentes.
+}
+
+async function getAdminCredentials() {
+    const snapshot = await rtdb.ref(ADMIN_AUTH_RTDB_PATH).once('value');
+    return snapshot.val(); // { username, passwordHash, updatedAt, tokenEpoch } | null
+}
+
+async function getAdminCredentialsCached() {
+    return getOrSetCache('admin_auth', CACHE_TTL.ADMIN_AUTH, getAdminCredentials);
+}
+
+async function setAdminCredentials(username, plainPassword) {
+    const passwordHash = await bcrypt.hash(plainPassword, 10);
+    const payload = { username, passwordHash, updatedAt: new Date().toISOString(), tokenEpoch: Date.now() };
+    await rtdb.ref(ADMIN_AUTH_RTDB_PATH).set(payload);
+    cacheDel('admin_auth'); // fuerza que todo bearer token viejo deje de ser válido de inmediato
+    return payload;
+}
+
+async function bootstrapAdminCredentials() {
+    try {
+        const existing = await getAdminCredentials();
+        if (existing && existing.username && existing.passwordHash) {
+            addLog('Credenciales de administrador ya configuradas (admin_auth).');
+            return;
+        }
+        const seedUser = process.env.ADMIN_USERNAME;
+        const seedPass = process.env.ADMIN_PASSWORD;
+        if (seedUser && seedPass) {
+            await setAdminCredentials(seedUser, seedPass);
+            addLog(`Credenciales de administrador creadas por primera vez para el usuario "${seedUser}". Puedes cambiarlas luego desde el panel.`);
+        } else {
+            console.warn('WARN: No hay credenciales de administrador configuradas (nodo admin_auth vacío) y tampoco ADMIN_USERNAME/ADMIN_PASSWORD en el entorno. El login NO funcionará hasta que definas esas variables una vez, o crees el nodo admin_auth manualmente.');
+        }
+    } catch (error) {
+        console.error('ERROR: No se pudo inicializar las credenciales de administrador:', error.message);
+    }
+}
+bootstrapAdminCredentials();
+
+async function requireAuth(req, res, next) {
+    if (req.session && req.session.isAuthenticated) {
+        req.authUsername = req.session.username;
+        return next();
+    }
+    const tokenAuth = await getAuthFromToken(req);
+    if (tokenAuth) {
+        req.authUsername = tokenAuth.username;
+        return next();
+    }
+    if (req.path.startsWith('/api/')) {
+        return res.status(401).json({ success: false, message: 'No autenticado. Inicia sesión para continuar.' });
+    }
+    return res.redirect('/login');
+}
+
+// Rutas públicas consumidas por la tienda y las apps de clientes.
+// Se compara por método + prefijo del path.
+const PUBLIC_ROUTES = [
+    { method: 'GET', prefix: '/login' },
+    { method: 'POST', prefix: '/api/auth/login' },
+    { method: 'POST', prefix: '/api/auth/logout' },
+    { method: 'GET', prefix: '/api/auth/me' },
+
+    { method: 'GET', prefix: '/p/' },
+    { method: 'POST', prefix: '/guardar-estadistica' },
+    { method: 'POST', prefix: '/send-pedido' },
+    { method: 'POST', prefix: '/rate-product' },
+    { method: 'GET', prefix: '/product-ratings' },
+
+    { method: 'GET', prefix: '/api/products' },
+    { method: 'GET', prefix: '/api/packs' },
+    { method: 'GET', prefix: '/api/bootstrap' },
+    { method: 'GET', prefix: '/api/ratings-summary' },
+    { method: 'GET', prefix: '/api/notification-banner' },
+    { method: 'GET', prefix: '/api/afiliados' },
+    { method: 'GET', prefix: '/api/mensajes' },
+    { method: 'GET', prefix: '/api/evento' },
+    { method: 'GET', prefix: '/api/info' },
+    { method: 'GET', prefix: '/api/pay' },
+    { method: 'GET', prefix: '/api/stream/' },
+
+    // Suscripción de tokens FCM: la usan dispositivos (clientes/staff) para
+    // recibir notificaciones, no el panel web. Si en tu caso solo la llama
+    // el propio panel, quítala de aquí para que también exija login.
+    { method: 'POST', prefix: '/api/suscribir-pedidos' }
+];
+
+function isPublicRoute(req) {
+    return PUBLIC_ROUTES.some(rule => rule.method === req.method && req.path.startsWith(rule.prefix));
+}
+
+// ---------------------------------------------------------------------
+// GATE DE AUTENTICACIÓN: a partir de aquí, TODO lo que no esté en
+// PUBLIC_ROUTES (incluyendo el panel estático servido más abajo) exige
+// sesión iniciada.
+// ---------------------------------------------------------------------
+const STATIC_SHELL_PATHS = new Set(['/', '/scripts.js', '/styles.css', '/logo_2.png']);
+
+app.use((req, res, next) => {
+    if (req.method === 'GET' && STATIC_SHELL_PATHS.has(req.path)) return next();
+    if (isPublicRoute(req)) return next();
+    return requireAuth(req, res, next);
+});
+
+app.post('/api/admin/analytics-presence', (req, res) => {
+    const { deviceId, sessionId, action } = req.body || {};
+    if (typeof deviceId !== 'string' || !/^[a-zA-Z0-9_-]{20,80}$/.test(deviceId)
+        || typeof sessionId !== 'string' || !/^[a-zA-Z0-9_-]{20,80}$/.test(sessionId)) {
+        return res.status(400).json({ success: false, message: 'Identificador de sesión inválido.' });
+    }
+    if (action === 'leave') {
+        return res.json({ success: true, activeSessions: analyticsPresence.leave(sessionId) });
+    }
+    if (action !== 'heartbeat') {
+        return res.status(400).json({ success: false, message: 'Acción de presencia inválida.' });
+    }
+    return res.json({
+        success: true,
+        activeSessions: analyticsPresence.heartbeat(deviceId, sessionId, req.authUsername || 'admin'),
+    });
+});
+
+// --- Rutas de autenticación ---
+
+app.post('/api/auth/login', rateLimitMiddleware, async (req, res) => {
+    try {
+        const { username, password } = req.body || {};
+        if (!username || !password) {
+            return res.status(400).json({ success: false, message: 'Usuario y contraseña son obligatorios.' });
+        }
+
+        const creds = await getAdminCredentials();
+        if (!creds || !creds.username || !creds.passwordHash) {
+            return res.status(503).json({ success: false, message: 'No hay credenciales de administrador configuradas en el servidor.' });
+        }
+
+        // Comparación de usuario sin filtrar por timing (longitud fija) + bcrypt para la contraseña.
+        const usernameMatches = String(username) === String(creds.username);
+        const passwordMatches = await bcrypt.compare(String(password), creds.passwordHash);
+
+        if (!usernameMatches || !passwordMatches) {
+            addLog(`Intento de login fallido para usuario "${username}".`);
+            return res.status(401).json({ success: false, message: 'Usuario o contraseña incorrectos.' });
+        }
+
+        req.session.isAuthenticated = true;
+        req.session.username = creds.username;
+        const token = createAuthToken(creds.username, creds.tokenEpoch);
+        addLog(`Login correcto: ${creds.username}`);
+        return res.json({ success: true, username: creds.username, token });
+    } catch (error) {
+        console.error('Error en /api/auth/login:', error);
+        return res.status(500).json({ success: false, message: 'Error interno al iniciar sesión.' });
+    }
+});
+
+app.post('/api/auth/logout', (req, res) => {
+    revokeAuthToken(req);
+    if (req.session) {
+        req.session.destroy(() => {
+            res.clearCookie('buquenque.sid');
+            return res.json({ success: true });
+        });
+    } else {
+        return res.json({ success: true });
+    }
+});
+
+app.get('/api/auth/me', async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    if (req.session && req.session.isAuthenticated) {
+        return res.json({ success: true, authenticated: true, username: req.session.username });
+    }
+    const tokenAuth = await getAuthFromToken(req);
+    if (tokenAuth) {
+        return res.json({ success: true, authenticated: true, username: tokenAuth.username });
+    }
+    return res.json({ success: true, authenticated: false });
+});
+
+// Cambiar usuario/contraseña. Requiere sesión activa Y la contraseña
+// actual correcta (aunque ya estés logueado, evita que alguien con la
+// sesión abierta en tu navegador la cambie sin saber la actual).
+app.post('/api/auth/change-password', async (req, res) => {
+    try {
+        const { currentPassword, newUsername, newPassword } = req.body || {};
+        if (!currentPassword || !newPassword) {
+            return res.status(400).json({ success: false, message: 'Debes indicar la contraseña actual y la nueva.' });
+        }
+        if (String(newPassword).length < 8) {
+            return res.status(400).json({ success: false, message: 'La nueva contraseña debe tener al menos 8 caracteres.' });
+        }
+
+        const creds = await getAdminCredentials();
+        if (!creds) {
+            return res.status(503).json({ success: false, message: 'No hay credenciales configuradas.' });
+        }
+
+        const currentOk = await bcrypt.compare(String(currentPassword), creds.passwordHash);
+        if (!currentOk) {
+            return res.status(401).json({ success: false, message: 'La contraseña actual no es correcta.' });
+        }
+
+        const finalUsername = (newUsername && String(newUsername).trim()) || creds.username;
+        await setAdminCredentials(finalUsername, String(newPassword));
+
+        // Invalida la sesión actual (cookie + token) para forzar reingreso con las nuevas credenciales.
+        revokeAuthToken(req);
+        req.session.destroy(() => {});
+        addLog(`Credenciales de administrador actualizadas (usuario: ${finalUsername}).`);
+        return res.json({ success: true, message: 'Credenciales actualizadas. Vuelve a iniciar sesión.' });
+    } catch (error) {
+        console.error('Error en /api/auth/change-password:', error);
+        return res.status(500).json({ success: false, message: 'Error interno al cambiar credenciales.' });
+    }
+});
+
+// Sirve la página de login (pública) y, después del gate, el resto del
+// panel (public/) que ahora exige sesión iniciada.
+app.get('/login', (req, res) => {
+    res.sendFile(__dirname + '/public/login.html');
+});
+
+app.use(express.static(path.join(__dirname, 'public'), { index: false }));
+
 // Configuración de rutas y archivos
-const path = require('path');
-const directoryPath = path.join(__dirname, "data");
-const filePath = path.join(directoryPath, "estadistica.json");
+const IS_SERVERLESS = Boolean(process.env.VERCEL);
+
+// Iniciar el programador diario de notificaciones FCM si no es serverless
+if (!IS_SERVERLESS) {
+    scheduleDailyDeliveryNotification();
+}
+
+const bundledDataPath = path.join(__dirname, "data");
+const directoryPath = IS_SERVERLESS ? path.join("/tmp", "data") : bundledDataPath;
+const fcmTokensFilePath = path.join(directoryPath, "fcm_tokens.json");
+const comparisonFilePath = path.join(directoryPath, "comparison.json");
+const dismissedOrdersFilePath = path.join(directoryPath, "dismissed_orders.json");
+const managedOrdersFilePath = path.join(directoryPath, "managed_orders.json");
 
 // Función para asegurar que el archivo de estadísticas existe
 async function ensureStatisticsFile() {
     try {
-        // Crear directorio si no existe
         if (!fs.existsSync(directoryPath)) {
             await fs.promises.mkdir(directoryPath, { recursive: true });
             addLog(`Directorio creado: ${directoryPath}`);
         }
 
-        // Crear archivo si no existe
-        if (!fs.existsSync(filePath)) {
-            await fs.promises.writeFile(filePath, JSON.stringify([], null, 2), 'utf8');
-            addLog(`Archivo creado: ${filePath}`);
+        if (IS_SERVERLESS && fs.existsSync(bundledDataPath)) {
+            for (const fileName of ["fcm_tokens.json", "comparison.json", "dismissed_orders.json", "managed_orders.json"]) {
+                const dest = path.join(directoryPath, fileName);
+                const src = path.join(bundledDataPath, fileName);
+                if (!fs.existsSync(dest) && fs.existsSync(src)) {
+                    await fs.promises.copyFile(src, dest);
+                    addLog(`Archivo semilla copiado a /tmp: ${fileName}`);
+                }
+            }
+        }
+
+        // Crear archivo de tokens FCM si no existe
+        if (!fs.existsSync(fcmTokensFilePath)) {
+            await fs.promises.writeFile(fcmTokensFilePath, JSON.stringify([], null, 2), 'utf8');
+            addLog(`Archivo creado: ${fcmTokensFilePath}`);
+        }
+
+        // Crear archivo de comparación si no existe
+        if (!fs.existsSync(comparisonFilePath)) {
+            await fs.promises.writeFile(comparisonFilePath, JSON.stringify([], null, 2), 'utf8');
+            addLog(`Archivo creado: ${comparisonFilePath}`);
+        }
+
+        // Crear archivo de pedidos descartados si no existe
+        if (!fs.existsSync(dismissedOrdersFilePath)) {
+            await fs.promises.writeFile(dismissedOrdersFilePath, JSON.stringify([], null, 2), 'utf8');
+            addLog(`Archivo creado: ${dismissedOrdersFilePath}`);
+        }
+
+        // Crear archivo de pedidos gestionados si no existe
+        if (!fs.existsSync(managedOrdersFilePath)) {
+            await fs.promises.writeFile(managedOrdersFilePath, JSON.stringify([], null, 2), 'utf8');
+            addLog(`Archivo creado: ${managedOrdersFilePath}`);
         }
     } catch (error) {
-        addLog(`ERROR: No se pudo crear el archivo de estadísticas: ${error.message}`);
+        addLog(`ERROR: No se pudo crear el archivo de estadísticas o tokens FCM: ${error.message}`);
         throw error;
     }
 }
@@ -229,6 +2159,42 @@ function sanitizeJSON(data) {
     }
 }
 
+async function readJsonFile(filePath, defaultValue = []) {
+    try {
+        const content = await fs.promises.readFile(filePath, 'utf8');
+        return content ? sanitizeJSON(content) : defaultValue;
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            return defaultValue;
+        }
+        throw error;
+    }
+}
+
+async function writeJsonFile(filePath, data) {
+    await fs.promises.writeFile(filePath, JSON.stringify(data, null, 2), 'utf8');
+}
+
+// Construye una clave única para identificar un pedido (mismo criterio que usa
+// la comparación local vs remota: ip + fecha_hora_entrada).
+function buildOrderKey(order) {
+    return `${order && order.ip ? order.ip : ''}|${order && order.fecha_hora_entrada ? order.fecha_hora_entrada : ''}`;
+}
+
+// Obtiene la lista de claves de pedidos descartados manualmente
+async function getDismissedOrders() {
+    return await readJsonFile(dismissedOrdersFilePath, []);
+}
+
+// Marca un pedido como descartado para que no vuelva a aparecer como "nuevo"
+async function addDismissedOrder(key) {
+    const dismissed = await getDismissedOrders();
+    if (!dismissed.includes(key)) {
+        dismissed.push(key);
+        await writeJsonFile(dismissedOrdersFilePath, dismissed);
+    }
+}
+
 // Middleware para registro de solicitudes
 app.use((req, res, next) => {
     addLog(`Solicitud: ${req.method} ${req.path}`);
@@ -253,40 +2219,45 @@ app.get(/^\/p\/(.*)/, async (req, res) => {
 
     console.log(`[Backend] Procesando producto: "${id}"`);
 
-    const PRODUCTS_URL = "https://raw.githubusercontent.com/supportcasafresca-cpu/Casa-Fresca/refs/heads/main/Json/products.json";
-
     try {
-        // Caché de 30s: los bots de WhatsApp/Facebook y los usuarios que
-        // comparten el mismo link golpean esta ruta muchas veces seguidas;
-        // sin caché cada visita descargaba products.json completo de GitHub.
-        const json = await getOrSetCache('products-json', CACHE_TTL.PRODUCTS_JSON, async () => {
-            const response = await fetch(PRODUCTS_URL);
-            if (!response.ok) throw new Error(`Fetch fallido: ${response.status}`);
-            return response.json();
-        });
-        
-        // Búsqueda en el JSON
-        const product = Array.isArray(json.products) && json.products.find(p => {
+        const siteBaseUrl = (PUBLIC_SITE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+        const productsObj = await getSecondaryProductMap();
+        const productsArray = Object.values(productsObj);
+
+        const searchId = String(id).trim();
+        const matchesSearchId = (p) => {
             const prodId = String(p.id).trim();
             const prodNombreEscaped = _escapeHtml(p.nombre).trim();
-            const searchId = String(id).trim();
             return prodId === searchId || prodNombreEscaped === searchId;
-        });
+        };
+
+        // Búsqueda en los productos
+        let product = productsArray.find(matchesSearchId);
+        let imageFolder = CLOUDINARY_PRODUCTS_FOLDER;
+
+        // Si no se encontró entre los productos, buscar también entre los
+        // packs (misma RTDB principal, nodo "packs") antes de dar "no encontrado".
+        if (!product) {
+            const packsObj = await getPackMap();
+            const packsArray = Object.values(packsObj);
+            product = packsArray.find(matchesSearchId);
+            if (product) imageFolder = CLOUDINARY_PACKS_FOLDER;
+        }
 
         if (!product) {
-            console.log(`[Backend] Producto "${id}" no encontrado.`);
+            console.log(`[Backend] Producto/Pack "${id}" no encontrado.`);
             return res.send(`<!DOCTYPE html>
         <html lang="es">
         <head>
             <meta charset="UTF-8">
             <meta property="og:title" content="Producto no encontrado - Casa Fresca" />
 
-            <link rel="icon" href="https://casa-fresca.onrender.com/Img/favicon.ico" type="image/x-icon" />
-            <link rel="shortcut icon" href="https://casa-fresca.onrender.com/Img/favicon.ico" />
+            <link rel="icon" href="${siteBaseUrl}/Img/favicon.ico" type="image/x-icon" />
+            <link rel="shortcut icon" href="${siteBaseUrl}/Img/favicon.ico" />
 
-            <meta property="og:image" content="https://casa-fresca.onrender.com/Img/social-share-banner.jpg" />
+            <meta property="og:image" content="${siteBaseUrl}/Img/favicon.png" />
         </head>
-        <body><script>window.location.href = "https://casa-fresca.onrender.com/index.html";</script></body>
+        <body><script>window.location.href = "${siteBaseUrl}/";</script></body>
         </html>`);
         }
 
@@ -306,12 +2277,13 @@ app.get(/^\/p\/(.*)/, async (req, res) => {
         // Datos para Meta Tags
         const nombre = product.nombre || "Producto";
         const descripcion = product.descripcion || "Disponible en Casa Fresca";
-        const imagen = (product.imagenes && product.imagenes.length) 
-            ? `https://raw.githubusercontent.com/supportcasafresca-cpu/Casa-Fresca/refs/heads/main/Img/products/${encodeURIComponent(product.imagenes[0])}`
-            : "https://casa-fresca.onrender.com/Img/social-share-banner.jpg";
+        const productFolderPath = imageFolder.split('/').map(encodeURIComponent).join('/');
+        const productImagePath = String(product.imagenes && product.imagenes[0] || '').split('/').map(encodeURIComponent).join('/');
+        const imagen = (product.imagenes && product.imagenes.length)
+            ? `https://res.cloudinary.com/${CLOUDINARY_CLOUD_NAME}/image/upload/f_webp,q_auto/${productFolderPath}/${productImagePath}`
+            : `${siteBaseUrl}/Img/favicon.png`;
 
-        // IMPORTANTE: URL absoluta para WhatsApp
-        const canonicalUrl = `https://casa-fresca.onrender.com/p/${encodeURIComponent(id)}`;
+        const canonicalUrl = `${siteBaseUrl}/p/${encodeURIComponent(id)}`;
 
         res.send(`<!DOCTYPE html>
         <html lang="es">
@@ -319,8 +2291,8 @@ app.get(/^\/p\/(.*)/, async (req, res) => {
             <meta charset="UTF-8">
             <title>${_escapeHtml(nombre)}</title>
 
-            <link rel="icon" href="https://casa-fresca.onrender.com/Img/favicon.ico" type="image/x-icon" />
-            <link rel="shortcut icon" href="https://casa-fresca.onrender.com/Img/favicon.ico" />
+            <link rel="icon" href="${siteBaseUrl}/Img/favicon.ico" type="image/x-icon" />
+            <link rel="shortcut icon" href="${siteBaseUrl}/Img/favicon.ico" />
 
             <meta property="og:site_name" content="Casa Fresca" />
 
@@ -341,8 +2313,7 @@ app.get(/^\/p\/(.*)/, async (req, res) => {
         </head>
         <body>
             <script>
-                // Redirigir al index usando el hash que lee tu script.js
-                window.location.href = "https://casa-fresca.onrender.com/index.html#" + encodeURIComponent("${id}");
+                window.location.href = "${siteBaseUrl}/#" + encodeURIComponent("${id}");
             </script>
         </body>
         </html>`);
@@ -363,11 +2334,9 @@ function _escapeHtml(unsafe) {
         .replace(/'/g, "&#039;");
 }
 
-// Ruta para guardar estadísticas
-app.post("/guardar-estadistica", async (req, res) => {
-    let release; // Declare release outside try to ensure it's accessible in finally
+app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
     try {
-        const nuevaEstadistica = req.body;
+        const nuevaEstadistica = req.body || {};
         addLog(`Recibida nueva estadística: ${JSON.stringify(nuevaEstadistica)}`);
 
         if (!nuevaEstadistica.ip || !nuevaEstadistica.pais || !nuevaEstadistica.origen) {
@@ -375,103 +2344,233 @@ app.post("/guardar-estadistica", async (req, res) => {
             return res.status(400).json({ error: "Faltan campos obligatorios" });
         }
 
-        release = await lockfile.lock(filePath); // Assign release here
-        addLog(`Archivo bloqueado: ${filePath}`);
+        nuevaEstadistica.compras = normalizarListaCompras(nuevaEstadistica.compras);
+        const tieneCompras = nuevaEstadistica.compras.length > 0;
 
-        fs.readFile(filePath, "utf8", (err, data) => {
-            if (err) {
-                if (err.code === 'ENOENT') {
-                    fs.writeFileSync(filePath, JSON.stringify([]));
-                    data = '[]';
-                    addLog(`Archivo no encontrado, inicializando: ${filePath}`);
-                } else {
-                    addLog(`ERROR: Error leyendo el archivo: ${err.message}`);
-                    if (release) release(); // Ensure unlock on error
-                    return res.status(500).json({ error: "Error leyendo el archivo" });
+        const usuarioExistente = await isKnownIp(nuevaEstadistica.ip);
+        if (!usuarioExistente) {
+            await markKnownIp(nuevaEstadistica.ip);
+        }
+        const fechaHoraCuba = nowInTimeZone('America/Havana');
+
+        const camposComunes = {
+            ip: nuevaEstadistica.ip,
+            pais: nuevaEstadistica.pais,
+            fecha_hora_entrada: fechaHoraCuba,
+            origen: nuevaEstadistica.origen,
+            afiliado: nuevaEstadistica.afiliado || "Ninguno",
+            duracion_sesion_segundos: nuevaEstadistica.duracion_sesion_segundos || 0,
+            tiempo_carga_pagina_ms: nuevaEstadistica.tiempo_carga_pagina_ms || 0,
+            navegador: nuevaEstadistica.navegador || "Desconocido",
+            sistema_operativo: nuevaEstadistica.sistema_operativo || "Desconocido",
+            tipo_usuario: usuarioExistente ? "Recurrente" : "Único",
+            tiempo_promedio_pagina: nuevaEstadistica.tiempo_promedio_pagina || 0,
+            fuente_trafico: nuevaEstadistica.fuente_trafico || "Desconocido",
+        };
+
+        if (tieneCompras) {
+            const clientOrderId = nuevaEstadistica.client_order_id ? String(nuevaEstadistica.client_order_id).trim() : null;
+
+            if (clientOrderId && secondaryRtdb) {
+                const existingIndexSnap = await secondaryRtdb.ref(`client_order_index/${clientOrderId}`).once('value');
+                const existingPedidoId = existingIndexSnap.val();
+                if (existingPedidoId) {
+                    const existingPedido = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, existingPedidoId);
+                    if (existingPedido) {
+                        addLog(`Pedido duplicado detectado por client_order_id ${clientOrderId}; se reutiliza pedido ${existingPedidoId} sin descontar stock de nuevo.`);
+                        return res.json({
+                            message: "Estadística guardada correctamente",
+                            orderNumber: existingPedido.orderNumber || existingPedido.numero_orden || null,
+                            pedidoId: existingPedidoId
+                        });
+                    }
                 }
             }
 
-            const estadisticas = data ? sanitizeJSON(data) : [];
-            const usuarioExistente = estadisticas.find(est => est.ip === nuevaEstadistica.ip);
+            let comprasParaGuardar = nuevaEstadistica.compras;
+            try {
+                const { compras: comprasSaneadas } = await sanitizarComprasYTotal(nuevaEstadistica.compras);
+                if (comprasSaneadas.length > 0) {
+                    comprasParaGuardar = comprasSaneadas;
+                } else {
+                    addLog('WARN: sanitizarComprasYTotal no resolvió ningún item; se guardan las compras originales sin sanear.');
+                }
+            } catch (sanitizeErr) {
+                addLog(`WARN: No se pudieron sanear las compras antes de guardar el pedido: ${sanitizeErr && sanitizeErr.message ? sanitizeErr.message : sanitizeErr}`);
+            }
 
-            const fechaHoraCuba = nowInTimeZone('America/Havana');
+            let stockResultado;
+            try {
+                stockResultado = await descontarStockPorCompras(comprasParaGuardar);
+            } catch (stockErr) {
+                addLog(`ERROR: excepción al validar/descontar stock en /guardar-estadistica: ${stockErr && stockErr.message ? stockErr.message : stockErr}`);
+                return res.status(500).json({
+                    success: false,
+                    error: "No se pudo verificar el stock disponible. Intenta de nuevo."
+                });
+            }
 
-            estadisticas.push({
-                ip: nuevaEstadistica.ip,
-                pais: nuevaEstadistica.pais,
-                fecha_hora_entrada: fechaHoraCuba,
-                origen: nuevaEstadistica.origen,
-                afiliado: nuevaEstadistica.afiliado || "Ninguno",
-                duracion_sesion_segundos: nuevaEstadistica.duracion_sesion_segundos || 0,
-                tiempo_carga_pagina_ms: nuevaEstadistica.tiempo_carga_pagina_ms || 0,
+            const huboProblemaStock = stockResultado.sinStock.length > 0
+                || stockResultado.noEncontrados.length > 0
+                || stockResultado.fallidos.length > 0;
+
+            if (huboProblemaStock) {
+                if (stockResultado.afectados && stockResultado.afectados.length > 0) {
+                    try {
+                        const comprasARestaurar = stockResultado.afectados.map(a => ({
+                            id: a.id,
+                            cantidad: Math.max(0, Number(a.stockAnterior ?? 0) - Number(a.stockNuevo ?? 0))
+                        }));
+                        await restaurarStockPorCompras(comprasARestaurar);
+                    } catch (restoreErr) {
+                        addLog(`ERROR: no se pudo restaurar el stock parcial tras rechazo por falta de existencia: ${restoreErr && restoreErr.message ? restoreErr.message : restoreErr}`);
+                    }
+                }
+                addLog(`Pedido rechazado por falta de stock. sinStock: ${JSON.stringify(stockResultado.sinStock)}`);
+                return res.status(409).json({
+                    success: false,
+                    error: "stock_insuficiente",
+                    message: "Uno o más productos de tu carrito ya no tienen existencia suficiente.",
+                    sinStock: stockResultado.sinStock,
+                    noEncontrados: stockResultado.noEncontrados,
+                    fallidos: stockResultado.fallidos
+                });
+            }
+
+            const orderNumber = await allocateNextOrderNumber();
+            const registroPedido = {
+                ...camposComunes,
                 nombre_comprador: nuevaEstadistica.nombre_comprador || "N/A",
                 telefono_comprador: nuevaEstadistica.telefono_comprador || "N/A",
                 nombre_persona_entrega: nuevaEstadistica.nombre_persona_entrega || "N/A",
                 telefono_persona_entrega: nuevaEstadistica.telefono_persona_entrega || "N/A",
                 correo_comprador: nuevaEstadistica.correo_comprador || "N/A",
                 direccion_envio: nuevaEstadistica.direccion_envio || "N/A",
-                compras: nuevaEstadistica.compras || [],
                 precio_compra_total: nuevaEstadistica.precio_compra_total || 0,
-                navegador: nuevaEstadistica.navegador || "Desconocido",
-                sistema_operativo: nuevaEstadistica.sistema_operativo || "Desconocido",
-                tipo_usuario: usuarioExistente ? "Recurrente" : "Único",
-                tiempo_promedio_pagina: nuevaEstadistica.tiempo_promedio_pagina || 0,
-                fuente_trafico: nuevaEstadistica.fuente_trafico || "Desconocido",
-            });
+                compras: comprasParaGuardar,
+                orderNumber,
+                numero_orden: orderNumber,
+                stock_decrementado: true,
+                stock_afectados: stockResultado.afectados || []
+            };
 
-            fs.writeFile(filePath, JSON.stringify(estadisticas, null, 2), (err) => {
-                if (err) {
-                    addLog(`ERROR: Error guardando el archivo: ${err.message}`);
-                    if (release) release(); // Ensure unlock on error
-                    return res.status(500).json({ error: "Error guardando el archivo" });
+            let pedidoId;
+            try {
+                pedidoId = await addSecondaryPushRecord(PEDIDOS_RTDB_PATH, registroPedido);
+            } catch (saveErr) {
+                addLog(`ERROR: no se pudo guardar el pedido tras descontar stock, se revierte el descuento: ${saveErr && saveErr.message ? saveErr.message : saveErr}`);
+                if (stockResultado.afectados && stockResultado.afectados.length > 0) {
+                    try {
+                        const comprasARestaurar = stockResultado.afectados.map(a => ({
+                            id: a.id,
+                            cantidad: Math.max(0, Number(a.stockAnterior ?? 0) - Number(a.stockNuevo ?? 0))
+                        }));
+                        await restaurarStockPorCompras(comprasARestaurar);
+                    } catch (restoreErr) {
+                        addLog(`ERROR: no se pudo restaurar el stock tras fallo al guardar el pedido: ${restoreErr && restoreErr.message ? restoreErr.message : restoreErr}`);
+                    }
                 }
-                addLog("Estadística guardada correctamente.");
-                if (release) release(); // Unlock on success
-                res.json({ message: "Estadística guardada correctamente" });
-            });
-        });
-    } catch (error) {
-        addLog(`ERROR: Error en /guardar-estadistica: ${error.message}`);
-        if (release) release(); // Ensure unlock on error
-        res.status(500).json({ error: "Error interno del servidor" });
-    }
-});
-
-// Ruta para obtener estadísticas
-app.get("/obtener-estadisticas", async (req, res) => {
-    let release; // Declare release outside try
-    try {
-        addLog("Solicitud para obtener estadísticas.");
-        release = await lockfile.lock(filePath); // Assign release here
-        addLog(`Archivo bloqueado para lectura: ${filePath}`);
-
-        fs.readFile(filePath, "utf8", (err, data) => {
-            if (err && err.code !== "ENOENT") {
-                addLog(`ERROR: Error leyendo el archivo de estadísticas: ${err.message}`);
-                if (release) release(); // Ensure unlock on error
-                return res.status(500).json({ error: "Error leyendo el archivo" });
+                return res.status(500).json({ success: false, error: "No se pudo guardar el pedido. Intenta de nuevo." });
             }
 
-            const estadisticas = data ? sanitizeJSON(data) : [];
-            addLog(`Estadísticas enviadas: ${estadisticas.length} registros.`);
-            if (release) release(); // Unlock on success
-            res.json(estadisticas);
-        });
+            addLog(`Pedido guardado correctamente en /pedidos (id: ${pedidoId}, orderNumber: ${orderNumber}). Stock ya descontado.`);
+
+            if (clientOrderId) {
+                const claim = await claimClientOrderId(clientOrderId, pedidoId);
+                if (!claim.isNew && claim.pedidoId && claim.pedidoId !== pedidoId) {
+                    const existingPedido = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, claim.pedidoId);
+                    addLog(`Pedido duplicado detectado tras crear registro (client_order_id ${clientOrderId}); se descarta ${pedidoId} y se revierte su stock, se reutiliza ${claim.pedidoId}.`);
+                    if (stockResultado.afectados && stockResultado.afectados.length > 0) {
+                        try {
+                            const comprasARestaurar = stockResultado.afectados.map(a => ({
+                                id: a.id,
+                                cantidad: Math.max(0, Number(a.stockAnterior ?? 0) - Number(a.stockNuevo ?? 0))
+                            }));
+                            await restaurarStockPorCompras(comprasARestaurar);
+                        } catch (restoreErr) {
+                            addLog(`ERROR: no se pudo restaurar el stock del pedido duplicado descartado: ${restoreErr && restoreErr.message ? restoreErr.message : restoreErr}`);
+                        }
+                    }
+                    try {
+                        await deleteSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoId);
+                    } catch (delErr) {
+                        addLog(`WARN: no se pudo eliminar el pedido duplicado descartado ${pedidoId}: ${delErr && delErr.message ? delErr.message : delErr}`);
+                    }
+                    return res.json({
+                        message: "Estadística guardada correctamente",
+                        orderNumber: (existingPedido && (existingPedido.orderNumber || existingPedido.numero_orden)) || orderNumber,
+                        pedidoId: claim.pedidoId
+                    });
+                }
+            }
+
+            return res.json({ message: "Estadística guardada correctamente", orderNumber, pedidoId, stockAfectado: stockResultado.afectados || [] });
+        } else {
+            // sin "compras": los stats puros no llevan compras ni datos de
+            // comprador/envío. Push O(1), ya no se reescribe el arreglo
+            // completo de estadísticas.
+            const estadisticaId = await addUserStatisticRecord(camposComunes);
+            addLog("Estadística guardada correctamente en /estadisticas.");
+            return res.json({ message: "Estadística guardada correctamente", estadisticaId });
+        }
     } catch (error) {
-        addLog(`ERROR: Error en /obtener-estadisticas: ${error.message}`);
-        if (release) release(); // Ensure unlock on error
+        addLog(`ERROR: Error en /guardar-estadistica: ${error.message}`);
+        if (error.message && error.message.includes('instancia secundaria de Firebase RTDB')) {
+            return res.status(503).json({ error: error.message });
+        }
         res.status(500).json({ error: "Error interno del servidor" });
     }
 });
 
-// ** IMPORTANTE: REEMPLAZA ESTA URL CON LA URL DE TU APLICACIÓN WEB DE APPS SCRIPT **
-// Esta es la URL que obtuviste al publicar tu script de Google Apps Script como Web App.
-const GOOGLE_APPS_SCRIPT_SHEETS_URL = ""; //"https://script.google.com/macros/s/AKfycbzcX8GDu-6sMegdKKAn5DgLMp9E8BzcM6C3j6WttFiAwiU1RhA42eDzAxIgql-Eat2xhA/exec";
+// Ruta para obtener estadísticas (histórico completo).
+// La colección se sirve desde la caché de 1 hora; el ETag evita que el panel
+// vuelva a descargar el mismo histórico si no cambió nada.
+app.get("/obtener-estadisticas", async (req, res) => {
+    try {
+        const estadisticas = await listUserStatisticsFromSecondary();
+        const { items, paginated, total, limit, offset } = paginateArray(estadisticas, req);
+        if (paginated) {
+            res.set('X-Total-Count', String(total));
+            res.set('X-Pagination', JSON.stringify({ total, limit, offset }));
+        }
+        return sendJsonSmart(req, res, items, { maxAge: 60 });
+    } catch (error) {
+        addLog(`ERROR: Error en /obtener-estadisticas: ${error.message}`);
+        if (error.message && error.message.includes('instancia secundaria de Firebase RTDB')) {
+            return res.status(503).json({ error: error.message });
+        }
+        res.status(500).json({ error: "Error interno del servidor" });
+    }
+});
 
-const GOOGLE_APPS_SCRIPT_CORREO_URL = "https://script.google.com/macros/s/AKfycby-g_Dtzo4eHPvChIO3Xr-fNGzVgAqhimHsW5zci3CcpwjMUze91kugN51KhNstVpot/exec";
+// Resumen agregado de visitas: contadores y series listas para pintar.
+// Evita que el dashboard tenga que descargar todo /estadisticas solo para
+// mostrar 4 tarjetas y un gráfico de barras.
+app.get('/api/stats/summary', async (req, res) => {
+    try {
+        await ensureStatisticsSummary();
+        const summaryTree = await getOrSetCache('stats:summary', 30 * 1000, async () => {
+            const snapshot = await secondaryRtdb.ref(STATS_SUMMARY_RTDB_PATH).once('value');
+            return snapshot.val() || createEmptySummary(statsSummaryCurrentMonth());
+        });
+        const resumen = toSummaryResponse(summaryTree, statsSummaryCurrentMonth());
+        return sendJsonSmart(req, res, { success: true, ...resumen }, { maxAge: 60 });
+    } catch (error) {
+        addLog(`ERROR: Error en /api/stats/summary: ${error.message}`);
+        if (error.message && error.message.includes('instancia secundaria de Firebase RTDB')) {
+            return res.status(503).json({ success: false, error: error.message });
+        }
+        res.status(500).json({ success: false, error: 'Error interno del servidor' });
+    }
+});
+
+const GOOGLE_APPS_SCRIPT_CORREO_URL = process.env.GOOGLE_APPS_SCRIPT_CORREO_URL || '';
+if (!GOOGLE_APPS_SCRIPT_CORREO_URL) {
+    console.warn('WARN: GOOGLE_APPS_SCRIPT_CORREO_URL no está configurada. No se enviarán correos desde Google Apps Script.');
+}
 
 // Ruta POST para recibir los datos del pedido desde el frontend
-app.post('/send-pedido', async (req, res) => {
+app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
     console.log('📦 Recibida solicitud de pedido desde el frontend.');
     const orderData = req.body;
 
@@ -480,195 +2579,799 @@ app.post('/send-pedido', async (req, res) => {
         return res.status(400).json({ success: false, message: 'Datos de pedido no proporcionados.' });
     }
 
-    try {
-        // 1. Enviar los datos al primer script (Web App)
-        console.log('Enviando datos a Google Apps Script (Principal)...');
-        const response = await fetch(GOOGLE_APPS_SCRIPT_CORREO_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(orderData),
-        });
+    let numeroOrdenResuelto = orderData.orderNumber || orderData.numero_orden || null;
 
-        // 2. Enviar los datos al segundo script (Sheets)
-        /*console.log('Enviando datos a Google Apps Script (Sheets)...');
-        const responseSheets = await fetch(GOOGLE_APPS_SCRIPT_SHEETS_URL,{
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(orderData),
-        });*/
-
-        await enviarNotificacionNuevoPedido(1);
-
-        // 3. Procesar las respuestas de texto a JSON de forma segura
-        const textResponse1 = await response.text();
-        //const textResponse2 = await responseSheets.text();
-
-        // NOTA: esta variable estaba comentada en el original (era global
-        // implícita). Se declara explícitamente para evitar errores.
-        let gasResponse;
-
-        // Parseo seguro respuesta 1
+    if (!numeroOrdenResuelto && orderData.pedidoId) {
         try {
-            gasResponse = JSON.parse(textResponse1);
-        } catch (e) {
-            console.warn('Respuesta 1 no es JSON válido:', textResponse1);
-            gasResponse = { status: "error", message: "Respuesta no válida del script principal", raw: textResponse1 };
+            const persistedPedido = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, orderData.pedidoId);
+            if (persistedPedido && (persistedPedido.orderNumber || persistedPedido.numero_orden)) {
+                numeroOrdenResuelto = persistedPedido.orderNumber || persistedPedido.numero_orden;
+                console.log(`🔢 Número de orden recuperado desde pedidoId (${orderData.pedidoId}): ${numeroOrdenResuelto}`);
+            }
+        } catch (lookupErr) {
+            console.warn('⚠️ No se pudo recuperar el pedido secundario para obtener orderNumber:', lookupErr && lookupErr.message ? lookupErr.message : lookupErr);
         }
+    }
 
-        // Parseo seguro respuesta 2
-        /*try {
-            gasResponseSheets = JSON.parse(textResponse2);
-        } catch (e) {
-            console.warn('Respuesta 2 no es JSON válido:', textResponse2);
-            gasResponseSheets = { status: "error", message: "Respuesta no válida del script sheets", raw: textResponse2 };
-        }*/
-
-        //console.log('Respuestas recibidas de Google. Actualizando local...');
-
-        // 4. Ejecutar la función local para actualizar la comparación
+    if (!numeroOrdenResuelto) {
         try {
-            await compareLocalAndRemoteData();
-            console.log('Comparación de pedidos actualizada tras nuevo pedido.');
-        } catch (updateError) {
-            console.error('Error al actualizar comparación tras pedido:', updateError);
-            // No detenemos el proceso si falla la actualización local, pero lo logueamos
-        }
+            numeroOrdenResuelto = await allocateNextOrderNumber();
+            console.log(`🔢 Número de orden generado en /send-pedido (no venía en el payload): ${numeroOrdenResuelto}`);
 
-        // 5. EVALUACIÓN FINAL Y ENVÍO DE UNA ÚNICA RESPUESTA
-        const mainSuccess = response.ok && gasResponse.status === "success";
-        //const sheetsSuccess = responseSheets.ok && gasResponseSheets.status === "success";
-
-        if (mainSuccess /*&& sheetsSuccess*/) {
-            // Caso ideal: Ambos funcionaron
-            return res.status(200).json({
-                success: true,
-                message: 'Pedido enviado correctamente a ambos sistemas.',
-                gasResponse: gasResponse,
-                //gasResponseSheets: gasResponseSheets
-            });
-        } else {
-            // Caso de error: Al menos uno falló
-            console.error('Hubo un error en uno de los servicios externos.');
-            return res.status(502).json({ // 502 Bad Gateway es apropiado cuando falla un servicio externo
-                success: false,
-                message: 'El pedido se procesó parcialmente o hubo un error en los servicios de Google.',
-                details: {
-                    principal: { success: mainSuccess, response: gasResponse },
-                    //sheets: { success: sheetsSuccess, response: gasResponseSheets }
+            // Si además hay un pedidoId (registro secundario) al que le faltaba
+            // el número, lo dejamos guardado ahí también para que quede
+            // consistente y no se vuelva a regenerar en próximas consultas.
+            if (orderData.pedidoId) {
+                try {
+                    await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, orderData.pedidoId, {
+                        orderNumber: numeroOrdenResuelto,
+                        numero_orden: numeroOrdenResuelto
+                    });
+                } catch (updErr) {
+                    console.warn('⚠️ No se pudo persistir el orderNumber generado en el registro secundario:', updErr && updErr.message ? updErr.message : updErr);
                 }
-            });
-        }
-
-    } catch (error) {
-        console.error('❌ Error CRÍTICO en el backend al procesar el pedido:', error);
-        
-        // Verificamos si los encabezados ya se enviaron para evitar el crash
-        if (!res.headersSent) {
-            return res.status(500).json({
-                success: false,
-                message: 'Error interno del servidor al procesar el pedido.',
-                error: error.message
-            });
+            }
+        } catch (allocErr) {
+            // No frenamos el pedido por esto: seguimos con "N/A" antes que
+            // perder la venta, pero queda registrado el fallo.
+            console.error('❌ No se pudo generar orderNumber de respaldo en /send-pedido:', allocErr && allocErr.message ? allocErr.message : allocErr);
         }
     }
-});
 
+    // Propagar el número resuelto a TODO el objeto que se usa de aquí en
+    // adelante (respaldo en Firebase y payload que recibe Apps Script).
+    orderData.orderNumber = numeroOrdenResuelto || orderData.orderNumber || null;
+    orderData.numero_orden = numeroOrdenResuelto || orderData.numero_orden || null;
 
-/*
-app.post('/delete-order', async (req, res) => {
-    const { rows } = req.body;
-
-    if (!rows || !Array.isArray(rows) || rows.length === 0) {
-        return res.status(400).json({ success: false, message: "Debes enviar un array de filas" });
-    }
+    const backupSaved = Boolean(orderData.pedidoId);
 
     try {
-        const response = await fetch(GOOGLE_APPS_SCRIPT_SHEETS_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                action: "deleteMultipleRows",
-                rows: rows
-            })
-        });
+        orderData.compras = normalizarListaCompras(orderData.compras);
+        let stockResultado = null;
 
-        const result = await response.json();
+        if (orderData.compras.length > 0) {
+            const pedidoIdSec = orderData.pedidoId || null;
+            let puedoDescontar = false;
 
-        if (result.status === "success") {
-            return res.json({ success: true, message: "Pedido eliminado correctamente" });
-        } else {
-            return res.status(500).json({ success: false, message: result.message });
-        }
-
-    } catch (error) {
-        return res.status(500).json({ success: false, message: error.message });
-    }
-});
-
-
-app.get('/api/pedidos-sheets', async (req, res) => {
-    try {
-        const response = await fetch(GOOGLE_APPS_SCRIPT_SHEETS_URL);
-        const data = await response.json();
-
-        if (data.status !== "success") {
-            return res.status(500).json({ success: false, message: "Error desde Apps Script" });
-        }
-
-        const filas = data.data;
-
-        // Agrupar por ip + fecha_hora_entrada
-        const pedidosAgrupados = {};
-
-        filas.forEach(fila => {
-            const key = fila.ip + "_" + fila.fecha_hora_entrada;
-
-            if (!pedidosAgrupados[key]) {
-                pedidosAgrupados[key] = {
-                    ip: fila.ip,
-                    pais: fila.pais,
-                    fecha_hora_entrada: fila.fecha_hora_entrada,
-                    origen: fila.origen,
-                    afiliado: fila.afiliado,
-                    duracion_sesion_segundos: fila.duracion_sesion_segundos,
-                    tiempo_carga_pagina_ms: fila.tiempo_carga_pagina_ms,
-                    nombre_comprador: fila.nombre_comprador,
-                    telefono_comprador: fila.telefono_comprador,
-                    nombre_persona_entrega: fila.nombre_persona_entrega,
-                    telefono_persona_entrega: fila.telefono_persona_entrega,
-                    correo_comprador: fila.correo_comprador,
-                    direccion_envio: fila.direccion_envio,
-                    compras: [],
-                    precio_compra_total: fila.precio_compra_total_pedido,
-                    navegador: fila.navegador,
-                    sistema_operativo: fila.sistema_operativo,
-                    tipo_usuario: fila.tipo_usuario,
-                    tiempo_promedio_pagina: fila.tiempo_promedio_pagina,
-                    fuente_trafico: fila.fuente_trafico
-                };
+            if (pedidoIdSec) {
+                try {
+                    puedoDescontar = await claimPedidoStockDecrement(PEDIDOS_RTDB_PATH, pedidoIdSec);
+                } catch (lookupErr) {
+                    puedoDescontar = false;
+                    console.warn('WARN: No se pudo reclamar stock_decrementado en /send-pedido, se omite el descuento:', lookupErr && lookupErr.message ? lookupErr.message : lookupErr);
+                }
+            } else {
+                console.warn('WARN: /send-pedido sin pedidoId, se omite el descuento de stock para evitar duplicados.');
+                addLog('WARN: /send-pedido recibido sin pedidoId; no se descuenta stock para evitar duplicado.');
             }
 
-            pedidosAgrupados[key].compras.push({
-                id: fila.id || null,
-                name: fila.producto_name,
-                quantity: fila.producto_quantity,
-                unitPrice: fila.producto_unitPrice,
-                discount: fila.producto_discount,
-                rowNumber: fila.rowNumber
+            if (puedoDescontar) {
+                try {
+                    let comprasParaDescontar = orderData.compras;
+                    try {
+                        const { compras: comprasSaneadas } = await sanitizarComprasYTotal(orderData.compras);
+                        if (comprasSaneadas.length > 0) comprasParaDescontar = comprasSaneadas;
+                    } catch (sanitizeErr) {
+                        console.warn('WARN: No se pudieron sanear las compras en /send-pedido:', sanitizeErr && sanitizeErr.message ? sanitizeErr.message : sanitizeErr);
+                    }
+
+                    stockResultado = await descontarStockPorCompras(comprasParaDescontar);
+                    console.log('Resultado del descuento de stock en /send-pedido:', JSON.stringify(stockResultado));
+                    if (!stockResultado.exitoso) {
+                        console.error('ERROR: el descuento de stock en /send-pedido quedó incompleto.', JSON.stringify({ noEncontrados: stockResultado.noEncontrados, fallidos: stockResultado.fallidos }));
+                    }
+
+                    if (pedidoIdSec) {
+                        try {
+                            await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoIdSec, {
+                                stock_decrementado: stockResultado.exitoso,
+                                stock_afectados: stockResultado.afectados || [],
+                                stock_error: stockResultado.exitoso ? null : { noEncontrados: stockResultado.noEncontrados || [], fallidos: stockResultado.fallidos || [] }
+                            });
+                        } catch (uErr) {
+                            console.warn('WARN: No se pudo marcar pedido secundario como stock_decrementado en /send-pedido:', uErr && uErr.message ? uErr.message : uErr);
+                        }
+                    }
+                } catch (errStock) {
+                    console.warn('No fue posible descontar stock en /send-pedido:', errStock && errStock.message ? errStock.message : errStock);
+                }
+            } else {
+                console.log('Pedido ya tenía stock_decrementado=true (o ya estaba siendo procesado), skip descuento.');
+            }
+        }
+
+        const nombreComprador = orderData.nombre_comprador || 'Cliente Nuevo';
+        const totalPedido = orderData.precio_compra_total || '0.00';
+
+        let correoSuccess = false;
+        let gasResponse = { status: 'skipped', message: 'No se configuró GOOGLE_APPS_SCRIPT_CORREO_URL' };
+
+        if (GOOGLE_APPS_SCRIPT_CORREO_URL) {
+            const CORREO_TIMEOUT_MS = 15000;
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), CORREO_TIMEOUT_MS);
+            try {
+                const response = await fetch(GOOGLE_APPS_SCRIPT_CORREO_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(orderData),
+                    signal: controller.signal
+                });
+                const textResponse = await response.text();
+                let parsed;
+                try {
+                    parsed = JSON.parse(textResponse);
+                } catch (e) {
+                    parsed = { status: 'error', message: 'Respuesta no válida del script de correo', raw: textResponse };
+                }
+                correoSuccess = Boolean(response.ok && parsed.status === 'success');
+                gasResponse = parsed;
+                addLog(`Correo del pedido ${orderData.orderNumber}: ${correoSuccess ? 'enviado correctamente' : 'con error (' + (parsed.message || 'sin detalle') + ')'}.`);
+            } catch (err) {
+                const esTimeout = err && err.name === 'AbortError';
+                correoSuccess = false;
+                gasResponse = { status: 'error', message: esTimeout ? `Timeout tras ${CORREO_TIMEOUT_MS}ms esperando a Apps Script` : (err && err.message ? err.message : String(err)) };
+                addLog(`ERROR enviando correo del pedido ${orderData.orderNumber}: ${gasResponse.message}`);
+            } finally {
+                clearTimeout(timeoutId);
+            }
+        }
+
+        // Mismo problema de fire-and-forget aplicaba al push: se espera
+        // también, pero un fallo de push NUNCA debe tumbar el pedido (por
+        // eso va en su propio try/catch independiente del correo).
+        try {
+            const responsePush = await admin.messaging().send({
+                notification: {
+                    title: '¡Nuevo Pedido Recibido! 📦',
+                    body: `${nombreComprador} ha comprado un total de $${totalPedido}.`
+                },
+                data: {
+                    origen: String(orderData.origen || 'web'),
+                    click_action: 'FLUTTER_NOTIFICATION_CLICK'
+                },
+                topic: 'pedidos'
             });
-        });
+            addLog(`Push enviado con éxito: ${responsePush}`);
+            console.log('Push enviado con éxito:', responsePush);
+        } catch (errorPush) {
+            addLog(`ERROR enviando Push: ${errorPush.message}`);
+            console.error('Error enviando notificación Push:', errorPush);
+        }
 
-        res.json({
-            success: true,
-            pedidos: Object.values(pedidosAgrupados)
-        });
+        const overallSuccess = backupSaved || Boolean(stockResultado);
 
+        if (overallSuccess) {
+            return res.status(200).json({
+                success: true,
+                message: 'Pedido recibido y guardado en Firebase.',
+                orderNumber: orderData.orderNumber || orderData.numero_orden || null,
+                pedidoKey: orderData.pedidoId || null,
+                correoSuccess,
+                gasResponse,
+                backupSaved
+            });
+        }
+
+        console.error('ERROR: No se pudo validar ninguna ruta de persistencia.');
+        return res.status(502).json({
+            success: false,
+            message: 'No se pudo guardar el pedido.',
+            backupSaved,
+            correoSuccess,
+            gasResponse
+        });
     } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
+        console.error('❌ Error CRÍTICO en /send-pedido:', error);
+        return res.status(500).json({
+            success: false,
+            message: 'Error interno del servidor al procesar el pedido.',
+            error: error.message,
+            backupSaved
+        });
     }
 });
 
-*/
+
+
+// =====================================================
+// 🧾 CRUD DE /pedidos (RTDB secundaria)
+// Pedidos completos (con "compras") creados automáticamente desde
+// /guardar-estadistica cuando el frontend envía una compra.
+// =====================================================
+
+// GET /api/pedidos -> listar todos los pedidos
+// Parámetros opcionales:
+//   ?compact=1        reduce compras a los campos que usa el panel
+//   ?limit=&offset=   paginación (se aplica sobre la lista ya cacheada)
+app.get('/api/pedidos', async (req, res) => {
+    try {
+        const pedidos = await listSecondaryPushCollection(PEDIDOS_RTDB_PATH);
+        const compact = req.query.compact === '1' || req.query.compact === 'true';
+        const proyectados = compact ? pedidos.map(p => projectPedido(p, true)) : pedidos.map(p => projectPedido(p, false));
+        const { items, paginated, total, limit, offset } = paginateArray(proyectados, req);
+        const payload = paginated
+            ? { success: true, pedidos: items, total, limit, offset }
+            : { success: true, pedidos: items };
+        return sendJsonSmart(req, res, payload, { maxAge: 15 });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener pedidos', error: error.message });
+    }
+});
+
+// GET /api/panel/pedidos -> pedidos + pedidos asignados hidratados en UNA
+// sola petición. Evita que el panel pida dos endpoints en paralelo y que cada
+// uno vuelva a leer /pedidos. Todo sale de la caché de colecciones.
+app.get('/api/panel/pedidos', async (req, res) => {
+    try {
+        const compact = req.query.compact !== '0';
+        const { pedidos, pedidosAsignados } = await getPanelPedidos();
+        const payload = {
+            success: true,
+            pedidos: pedidos.map(p => projectPedido(p, compact)),
+            pedidosAsignados: pedidosAsignados.map(p => projectPedido(p, compact))
+        };
+        return sendJsonSmart(req, res, payload, { maxAge: 15 });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener los pedidos del panel', error: error.message });
+    }
+});
+
+// GET /api/pedidos/:id -> obtener un pedido puntual (siempre completo, sin
+// los campos internos de stock)
+app.get('/api/pedidos/:id', async (req, res) => {
+    try {
+        const pedido = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, req.params.id);
+        if (!pedido) {
+            return res.status(404).json({ success: false, message: 'Pedido no encontrado.' });
+        }
+        return sendJsonSmart(req, res, { success: true, pedido: projectPedido(pedido, false) }, { maxAge: 0 });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener el pedido', error: error.message });
+    }
+});
+
+// PUT/PATCH /api/pedidos/:id -> editar un pedido
+const PEDIDO_CONTACT_FIELD_LIMITS = Object.freeze({
+    nombre_comprador: 160,
+    telefono_comprador: 50,
+    direccion_envio: 500
+});
+
+function sanitizePedidoContactPatch(payload) {
+    const patch = {};
+    for (const [campo, maxLength] of Object.entries(PEDIDO_CONTACT_FIELD_LIMITS)) {
+        if (!Object.prototype.hasOwnProperty.call(payload, campo)) continue;
+        const valor = payload[campo];
+        if (valor !== null && typeof valor !== 'string') {
+            const error = new Error(`El campo ${campo} debe ser texto.`);
+            error.statusCode = 400;
+            throw error;
+        }
+        const texto = String(valor || '').trim();
+        if (texto.length > maxLength) {
+            const error = new Error(`El campo ${campo} supera el máximo de ${maxLength} caracteres.`);
+            error.statusCode = 400;
+            throw error;
+        }
+        patch[campo] = texto;
+    }
+    return patch;
+}
+
+async function actualizarPedidoHandler(req, res) {
+    try {
+        const existente = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, req.params.id);
+        if (!existente) {
+            return res.status(404).json({ success: false, message: 'Pedido no encontrado.' });
+        }
+        const patch = { ...(req.body || {}) };
+        delete patch.id; // el id no se modifica
+        Object.assign(patch, sanitizePedidoContactPatch(patch));
+
+        if (Array.isArray(patch.compras)) {
+            const { compras, total } = await sanitizarComprasYTotal(patch.compras);
+            patch.compras = compras;
+            patch.precio_compra_total = total;
+        }
+
+        const actualizado = await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, req.params.id, patch);
+        return res.json({ success: true, pedido: actualizado });
+    } catch (error) {
+        return res.status(error.statusCode || 500).json({ success: false, message: 'Error al actualizar el pedido', error: error.message });
+    }
+}
+app.put('/api/pedidos/:id', actualizarPedidoHandler);
+app.patch('/api/pedidos/:id', actualizarPedidoHandler);
+
+// DELETE /api/pedidos/:id -> eliminar un pedido de /pedidos
+app.delete('/api/pedidos/:id', async (req, res) => {
+    try {
+        const existente = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, req.params.id);
+        if (!existente) {
+            return res.status(404).json({ success: false, message: 'Pedido no encontrado.' });
+        }
+
+        await deleteSecondaryPushRecord(PEDIDOS_RTDB_PATH, req.params.id);
+
+        let resultadoStock = null;
+        if (existente.stock_decrementado === true && Array.isArray(existente.compras) && existente.compras.length > 0) {
+            try {
+                resultadoStock = await restaurarStockPorCompras(existente.compras);
+                if (resultadoStock.actualizado) {
+                    addLog(`Stock restaurado por eliminación de pedido ${req.params.id}: ${JSON.stringify(resultadoStock.afectados)}`);
+                }
+                if (!resultadoStock.exitoso) {
+                    addLog(`ERROR: la restauración de stock del pedido eliminado ${req.params.id} quedó incompleta. noEncontrados: ${JSON.stringify(resultadoStock.noEncontrados)}, fallidos: ${JSON.stringify(resultadoStock.fallidos)}`);
+                }
+            } catch (stockError) {
+                addLog(`ERROR restaurando stock del pedido eliminado ${req.params.id}: ${stockError && stockError.message ? stockError.message : stockError}`);
+            }
+        }
+
+        return res.json({ success: true, deletedId: req.params.id, stockRestaurado: resultadoStock });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al eliminar el pedido', error: error.message });
+    }
+});
+
+app.post('/api/pedidos/:id/asignar', async (req, res) => {
+    try {
+        const pedidoOriginal = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, req.params.id);
+        if (!pedidoOriginal) {
+            return res.status(404).json({ success: false, message: 'Pedido no encontrado en /pedidos.' });
+        }
+
+        const usuarioReincidente = await checkUsuarioReincidente(pedidoOriginal, pedidoOriginal.id);
+
+        const CAMPOS_ESTADO = ['aceptado', 'entregado', 'pendiente_pago', 'pagado', 'estado'];
+        const estadosIniciales = {};
+        if (req.body && typeof req.body === 'object') {
+            CAMPOS_ESTADO.forEach(campo => {
+                if (req.body[campo] !== undefined) estadosIniciales[campo] = req.body[campo];
+            });
+            // fecha_entrega: formato YYYY-MM-DD, opcional
+            if (req.body.fecha_entrega !== undefined) {
+                const fecha = String(req.body.fecha_entrega).trim();
+                if (fecha === '' || /^\d{4}-\d{2}-\d{2}$/.test(fecha)) {
+                    estadosIniciales.fecha_entrega = fecha || null;
+                }
+            }
+        }
+
+        // Registro delgado: NO se copian los datos del pedido (compras,
+        // nombre_comprador, direccion_envio, etc), solo la referencia al
+        // pedido de origen y los campos propios del seguimiento. El resto se
+        // reconstruye al leer, uniendo con /pedidos por pedido_origen_id.
+        const nuevoRegistro = {
+            pedido_origen_id: pedidoOriginal.id,
+            usuarioReincidente,
+            fecha_asignacion: nowInTimeZone('America/Havana'),
+            ...estadosIniciales
+        };
+
+        const asignadoId = await addSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, nuevoRegistro);
+        const pedidoAsignado = await getSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, asignadoId);
+        const pedidoHidratado = hidratarPedidoAsignadoConOrigen(pedidoAsignado, pedidoOriginal);
+
+        addLog(`Pedido ${pedidoOriginal.id} asignado a seguimiento (id: ${asignadoId}, reincidente: ${usuarioReincidente}).`);
+        return res.status(201).json({ success: true, pedido: pedidoHidratado });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al asignar el pedido', error: error.message });
+    }
+});
+
+// =====================================================
+// 🚚 CRUD DE /pedidos_asignados (seguimiento individual)
+// =====================================================
+
+app.get('/api/pedidos-asignados', async (req, res) => {
+    try {
+        const pedidosAsignados = await listarPedidosAsignadosHidratados();
+        const compact = req.query.compact === '1' || req.query.compact === 'true';
+        const proyectados = pedidosAsignados.map(p => projectPedido(p, compact));
+        const { items, paginated, total, limit, offset } = paginateArray(proyectados, req);
+        const payload = paginated
+            ? { success: true, pedidosAsignados: items, total, limit, offset }
+            : { success: true, pedidosAsignados: items };
+        return sendJsonSmart(req, res, payload, { maxAge: 15 });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener pedidos asignados', error: error.message });
+    }
+});
+
+app.get('/api/pedidos-asignados/:id', async (req, res) => {
+    try {
+        const pedido = await getSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id);
+        if (!pedido) {
+            return res.status(404).json({ success: false, message: 'Pedido asignado no encontrado.' });
+        }
+        const pedidoHidratado = await hidratarPedidoAsignado(pedido);
+        return sendJsonSmart(req, res, { success: true, pedido: projectPedido(pedidoHidratado, false) }, { maxAge: 0 });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener el pedido asignado', error: error.message });
+    }
+});
+
+async function actualizarPedidoAsignadoHandler(req, res) {
+    try {
+        const existente = await getSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id);
+        if (!existente) {
+            return res.status(404).json({ success: false, message: 'Pedido asignado no encontrado.' });
+        }
+        const patch = { ...(req.body || {}) };
+        delete patch.id;
+        delete patch.pedido_origen_id; // el vínculo con /pedidos no se reasigna por acá
+        const datosComprador = sanitizePedidoContactPatch(patch);
+        Object.keys(PEDIDO_CONTACT_FIELD_LIMITS).forEach(campo => delete patch[campo]);
+
+        // Validar y permitir actualizar fecha_entrega (formato YYYY-MM-DD o vacío/null)
+        if (patch.fecha_entrega !== undefined) {
+            const fecha = String(patch.fecha_entrega).trim();
+            if (fecha === '' || /^\d{4}-\d{2}-\d{2}$/.test(fecha)) {
+                patch.fecha_entrega = fecha || null;
+            } else {
+                return res.status(400).json({ success: false, message: 'Formato de fecha_entrega inválido. Use YYYY-MM-DD.' });
+            }
+        }
+
+        // "compras" (y su total) ya no viven en el registro delgado de
+        // /pedidos_asignados: pertenecen al pedido de origen en /pedidos, así
+        // que cualquier edición de productos se aplica ahí.
+        if (Array.isArray(patch.compras)) {
+            const { compras, total } = await sanitizarComprasYTotal(patch.compras);
+            if (existente.pedido_origen_id) {
+                await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, existente.pedido_origen_id, {
+                    compras,
+                    precio_compra_total: total
+                });
+            }
+            delete patch.compras;
+            delete patch.precio_compra_total;
+        }
+
+        let actualizado;
+        if (Object.keys(datosComprador).length > 0) {
+            if (!existente.pedido_origen_id) {
+                return res.status(409).json({ success: false, message: 'Este pedido asignado no tiene un pedido de origen editable.' });
+            }
+            const pedidoOrigen = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, existente.pedido_origen_id);
+            if (!pedidoOrigen) {
+                return res.status(409).json({ success: false, message: 'No se encontró el pedido original para guardar los datos del comprador.' });
+            }
+            const updates = {};
+            Object.entries(datosComprador).forEach(([campo, valor]) => {
+                updates[`${PEDIDOS_RTDB_PATH}/${existente.pedido_origen_id}/${campo}`] = valor;
+            });
+            if (Object.prototype.hasOwnProperty.call(datosComprador, 'nombre_comprador') ||
+                Object.prototype.hasOwnProperty.call(datosComprador, 'telefono_comprador')) {
+                const usuarioReincidente = await checkUsuarioReincidente(
+                    { ...pedidoOrigen, ...datosComprador },
+                    existente.pedido_origen_id
+                );
+                updates[`${PEDIDOS_ASIGNADOS_RTDB_PATH}/${req.params.id}/usuarioReincidente`] = usuarioReincidente;
+            }
+            Object.entries(patch).forEach(([campo, valor]) => {
+                updates[`${PEDIDOS_ASIGNADOS_RTDB_PATH}/${req.params.id}/${campo}`] = valor;
+            });
+            await secondaryRtdb.ref().update(updates);
+            invalidatePedidosCaches();
+            actualizado = await getSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id);
+        } else {
+            actualizado = Object.keys(patch).length > 0
+                ? await updateSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id, patch)
+                : await getSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id);
+        }
+
+        const pedidoHidratado = await hidratarPedidoAsignado(actualizado);
+        return res.json({ success: true, pedido: pedidoHidratado });
+    } catch (error) {
+        return res.status(error.statusCode || 500).json({ success: false, message: 'Error al actualizar el pedido asignado', error: error.message });
+    }
+}
+app.put('/api/pedidos-asignados/:id', actualizarPedidoAsignadoHandler);
+app.patch('/api/pedidos-asignados/:id', actualizarPedidoAsignadoHandler);
+
+app.delete('/api/pedidos-asignados/:id', async (req, res) => {
+    try {
+        const existente = await getSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id);
+        if (!existente) {
+            return res.status(404).json({ success: false, message: 'Pedido asignado no encontrado.' });
+        }
+
+        // Quitar un pedido de /pedidos_asignados NO elimina el pedido: el
+        // registro de origen sigue existiendo en /pedidos (vuelve a
+        // "pedidos nuevos") con su stock ya descontado. Por eso NUNCA se
+        // restaura stock aquí: hacerlo duplicaría la restauración que ya
+        // ocurre cuando el pedido se elimina de verdad desde /pedidos
+        // (DELETE /api/pedidos/:id), dejando stock de más cada vez que un
+        // pedido se asigna y desasigna de seguimiento.
+        await deleteSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id);
+
+        return res.json({ success: true, deletedId: req.params.id, stockRestaurado: null });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al eliminar el pedido asignado', error: error.message });
+    }
+});
+
+// =====================================================
+// 🧹 MIGRACIÓN DE REGISTROS YA EXISTENTES A FORMATO DELGADO
+// Todo lo de arriba solo afecta a los registros NUEVOS. Estos endpoints son
+// para correr una vez (desde el panel o con curl, requieren sesión de admin
+// porque no están en PUBLIC_ROUTES) y reducir el peso de lo que ya está
+// guardado en Firebase. Son idempotentes: se pueden correr varias veces sin
+// problema, los registros que ya están delgados/limpios se saltan.
+// =====================================================
+
+// Campos propios del seguimiento que SÍ se conservan en /pedidos_asignados.
+// Cualquier otro campo (compras, nombre_comprador, direccion_envio, etc.) es
+// una copia redundante del pedido en /pedidos y se elimina.
+const CAMPOS_PEDIDO_ASIGNADO_PROPIOS = [
+    'pedido_origen_id', 'usuarioReincidente', 'fecha_asignacion',
+    'aceptado', 'entregado', 'pendiente_pago', 'pagado', 'estado',
+    'importado_historico', 'fecha_entrega'
+];
+
+async function processInBatches(items, batchSize, worker) {
+    for (let i = 0; i < items.length; i += batchSize) {
+        const batch = items.slice(i, i + batchSize);
+        await Promise.all(batch.map(worker));
+    }
+}
+
+app.post('/api/pedidos-asignados/migrar-legado', async (req, res) => {
+    try {
+        const limit = Math.max(1, Math.min(2000, parseInt(req.query.limit, 10) || 1000));
+        const [asignados, pedidos] = await Promise.all([
+            listSecondaryPushCollection(PEDIDOS_ASIGNADOS_RTDB_PATH),
+            listSecondaryPushCollection(PEDIDOS_RTDB_PATH)
+        ]);
+        const pedidosPorId = new Map(pedidos.map(p => [p.id, p]));
+
+        const pendientes = asignados.filter(asignado => {
+            const camposDeMas = Object.keys(asignado).filter(
+                campo => campo !== 'id' && !CAMPOS_PEDIDO_ASIGNADO_PROPIOS.includes(campo)
+            );
+            return camposDeMas.length > 0 && Boolean(asignado.pedido_origen_id);
+        });
+
+        let omitidos = asignados.length - pendientes.length;
+        let migrados = 0;
+        const errores = [];
+        const lote = pendientes.slice(0, limit);
+
+        await processInBatches(lote, 40, async (asignado) => {
+            const pedidoOrigen = pedidosPorId.get(asignado.pedido_origen_id);
+            if (!pedidoOrigen) {
+                omitidos++;
+                return;
+            }
+            const registroDelgado = {};
+            CAMPOS_PEDIDO_ASIGNADO_PROPIOS.forEach(campo => {
+                if (asignado[campo] !== undefined) registroDelgado[campo] = asignado[campo];
+            });
+            try {
+                await secondaryRtdb.ref(`${PEDIDOS_ASIGNADOS_RTDB_PATH}/${asignado.id}`).set(registroDelgado);
+                migrados++;
+            } catch (err) {
+                errores.push({ id: asignado.id, error: err.message });
+            }
+        });
+
+        invalidatePedidosCaches();
+        const restantes = pendientes.length - lote.length;
+        addLog(`Migración de /pedidos_asignados a formato delgado: ${migrados} migrados, ${omitidos} omitidos, ${errores.length} errores, ${restantes} restantes.`);
+        return res.json({ success: true, total: asignados.length, migrados, omitidos, errores, restantes, hasMore: restantes > 0 });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error migrando pedidos asignados', error: error.message });
+    }
+});
+
+// Campos de comprador/envío que en una visita SIN compra siempre quedaban
+// guardados con el valor por defecto ("N/A" / 0). Solo se eliminan cuando
+// TODOS valen exactamente eso: si un registro viejo tiene algún dato real
+// distinto de ese default, se deja intacto por seguridad.
+const CAMPOS_ESTADISTICA_REDUNDANTES = [
+    'nombre_comprador', 'telefono_comprador', 'nombre_persona_entrega',
+    'telefono_persona_entrega', 'correo_comprador', 'direccion_envio',
+    'precio_compra_total'
+];
+
+function estadisticaTieneSoloDefaults(registro) {
+    const textoEsDefault = (valor) => String(valor ?? 'N/A').trim().toUpperCase() === 'N/A';
+    return textoEsDefault(registro.nombre_comprador)
+        && textoEsDefault(registro.telefono_comprador)
+        && textoEsDefault(registro.nombre_persona_entrega)
+        && textoEsDefault(registro.telefono_persona_entrega)
+        && textoEsDefault(registro.correo_comprador)
+        && textoEsDefault(registro.direccion_envio)
+        && Number(registro.precio_compra_total ?? 0) === 0
+        && !Array.isArray(registro.compras);
+}
+
+app.post('/api/estadisticas/migrar-legado', async (req, res) => {
+    try {
+        const limit = Math.max(1, Math.min(3000, parseInt(req.query.limit, 10) || 1500));
+        const estadisticas = await listUserStatisticsFromSecondary();
+
+        const pendientes = estadisticas.filter(registro => {
+            const tieneCamposRedundantes = CAMPOS_ESTADISTICA_REDUNDANTES.some(campo => registro[campo] !== undefined);
+            return tieneCamposRedundantes && estadisticaTieneSoloDefaults(registro);
+        });
+
+        const omitidos = estadisticas.length - pendientes.length;
+        let migrados = 0;
+        const errores = [];
+        const lote = pendientes.slice(0, limit);
+
+        await processInBatches(lote, 40, async (registro) => {
+            const limpio = { ...registro };
+            delete limpio.id;
+            CAMPOS_ESTADISTICA_REDUNDANTES.forEach(campo => delete limpio[campo]);
+            try {
+                await secondaryRtdb.ref(`${ESTADISTICAS_RTDB_PATH}/${registro.id}`).set(limpio);
+                migrados++;
+            } catch (err) {
+                errores.push({ id: registro.id, error: err.message });
+            }
+        });
+
+        cacheDel(pushListCacheKey(ESTADISTICAS_RTDB_PATH));
+        cacheDel('stats:summary');
+        const restantes = pendientes.length - lote.length;
+        addLog(`Migración de /estadisticas a formato delgado: ${migrados} migrados, ${omitidos} omitidos, ${errores.length} errores, ${restantes} restantes.`);
+        return res.json({ success: true, total: estadisticas.length, migrados, omitidos, errores, restantes, hasMore: restantes > 0 });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error migrando estadísticas', error: error.message });
+    }
+});
+const NOTIFICATION_BANNER_PATH = 'notificationBanner';
+
+app.get('/api/notification-banner', async (req, res) => {
+    try {
+        const banner = await getOrSetCache('notification-banner', CACHE_TTL.NOTIFICATION, async () => {
+            const snapshot = await rtdb.ref(NOTIFICATION_BANNER_PATH).once('value');
+            return snapshot.val() || null;
+        });
+        setPublicCacheHeaders(res, 30, 120);
+        return res.json({ success: true, banner: banner || null });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener el banner de notificación', error: error.message });
+    }
+});
+
+app.get('/api/afiliados', async (req, res) => {
+    try {
+        const afiliados = await getOrSetCache('afiliados', CACHE_TTL.PUBLIC_DATA, async () => {
+            const snapshot = await rtdb.ref('afiliados').once('value');
+            const data = snapshot.val();
+            return Array.isArray(data) ? data : (data ? Object.values(data) : []);
+        });
+        setPublicCacheHeaders(res, 120, 600);
+        return res.json({ success: true, afiliados });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener afiliados', error: error.message });
+    }
+});
+
+app.get('/api/mensajes', async (req, res) => {
+    try {
+        const mensajes = await getOrSetCache('mensajes', CACHE_TTL.PUBLIC_DATA, async () => {
+            const snapshot = await rtdb.ref('mensajes').once('value');
+            const data = snapshot.val();
+            return Array.isArray(data) ? data : (data ? Object.values(data) : []);
+        });
+        setPublicCacheHeaders(res, 120, 600);
+        return res.json({ success: true, mensajes });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener mensajes', error: error.message });
+    }
+});
+
+app.get('/api/evento', async (req, res) => {
+    try {
+        const evento = await getOrSetCache('evento', CACHE_TTL.PUBLIC_DATA, async () => {
+            const snapshot = await rtdb.ref('evento').once('value');
+            return snapshot.val() || null;
+        });
+        setPublicCacheHeaders(res, 120, 600);
+        return res.json({ success: true, evento: evento || null });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener evento', error: error.message });
+    }
+});
+
+app.get('/api/info', async (req, res) => {
+    try {
+        const info = await getOrSetCache('info', CACHE_TTL.PUBLIC_DATA, async () => {
+            const snapshot = await rtdb.ref('info').once('value');
+            const data = snapshot.val();
+            return Array.isArray(data) ? data : (data ? Object.values(data) : []);
+        });
+        setPublicCacheHeaders(res, 120, 600);
+        return res.json({ success: true, info });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener info', error: error.message });
+    }
+});
+
+app.put('/api/info/:productId', async (req, res) => {
+    try {
+        const { productId } = req.params;
+        if (!productId) {
+            return res.status(400).json({ success: false, message: 'Falta el ID del producto.' });
+        }
+        const texto = String((req.body && req.body.info) || '').trim();
+        if (!texto) {
+            return res.status(400).json({ success: false, message: 'El campo "info" no puede estar vacío.' });
+        }
+        const entry = { id: productId, info: texto };
+        await rtdb.ref(`info/${productId}`).set(entry);
+        cacheDel('info');
+        return res.json({ success: true, entry });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al guardar la info del producto', error: error.message });
+    }
+});
+
+app.delete('/api/info/:productId', async (req, res) => {
+    try {
+        const { productId } = req.params;
+        if (!productId) {
+            return res.status(400).json({ success: false, message: 'Falta el ID del producto.' });
+        }
+        await rtdb.ref(`info/${productId}`).remove();
+        cacheDel('info');
+        return res.json({ success: true, deletedId: productId });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al eliminar la info del producto', error: error.message });
+    }
+});
+
+app.get('/api/pay', async (req, res) => {
+    try {
+        const pay = await getOrSetCache('pay', CACHE_TTL.PUBLIC_DATA, async () => {
+            const snapshot = await rtdb.ref('pay').once('value');
+            return snapshot.val() || null;
+        });
+        setPublicCacheHeaders(res, 120, 600);
+        return res.json({ success: true, pay: pay || null });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener pay', error: error.message });
+    }
+});
+
+async function guardarNotificationBannerHandler(req, res) {
+    try {
+        const body = req.body || {};
+        const snapshot = await rtdb.ref(NOTIFICATION_BANNER_PATH).once('value');
+        const actual = snapshot.val() || {};
+
+        // El id nunca lo decide el cliente: se regenera siempre distinto al
+        // anterior (timestamp en milisegundos) para que se detecte como nuevo.
+        let nuevoId = Date.now();
+        if (nuevoId === actual.id) nuevoId += 1;
+
+        const banner = {
+            id: nuevoId,
+            icono: body.icono !== undefined ? String(body.icono) : (actual.icono || 'fas fa-bell'),
+            titulo: body.titulo !== undefined ? String(body.titulo) : (actual.titulo || ''),
+            subtitulo: body.subtitulo !== undefined ? String(body.subtitulo) : (actual.subtitulo || ''),
+            mensaje: body.mensaje !== undefined ? String(body.mensaje) : (actual.mensaje || ''),
+            tipo: body.tipo !== undefined ? String(body.tipo) : (actual.tipo || 'info')
+        };
+
+        await rtdb.ref(NOTIFICATION_BANNER_PATH).set(banner);
+        cacheSet('notification-banner', banner, CACHE_TTL.NOTIFICATION);
+        addLog(`Banner de notificación actualizado (id: ${banner.id}).`);
+        return res.json({ success: true, banner });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al guardar el banner de notificación', error: error.message });
+    }
+}
+app.post('/api/notification-banner', guardarNotificationBannerHandler);
+app.put('/api/notification-banner', guardarNotificationBannerHandler);
+app.patch('/api/notification-banner', guardarNotificationBannerHandler);
 
 // Nueva ruta API para obtener el estado del servidor
 app.get("/api/server-status", async (req, res) => {
@@ -688,9 +3391,14 @@ app.get("/api/server-status", async (req, res) => {
         const cpuCount = os.cpus().length || 1;
         const cpuPercent = ((elapUsage.user + elapUsage.system) / elapMicros) * 100 / cpuCount;
 
+        const uptimeHistory = await getUptimeHistory();
+        const monthUptime = summarizeMonthUptime(uptimeHistory, UPTIME_TIMEZONE);
+
         res.json({
             status: "running",
             startTime: serverStartTime.toISOString(),
+            uptimeSeconds: process.uptime(),
+            nodeVersion: process.version,
             logs: serverLogs,
             memory: {
                 rss: memory.rss,
@@ -702,7 +3410,14 @@ app.get("/api/server-status", async (req, res) => {
                 percent: Number(cpuPercent.toFixed(2)),
                 cores: cpuCount,
                 sampleMs: 100
-            }
+            },
+            system: {
+                totalMemory: os.totalmem(),
+                freeMemory: os.freemem(),
+                loadAverage: os.loadavg()
+            },
+            uptimeHistory,
+            monthUptime
         });
     } catch (err) {
         addLog(`ERROR: No se pudo calcular uso de CPU/memoria: ${err.message}`);
@@ -710,138 +3425,138 @@ app.get("/api/server-status", async (req, res) => {
     }
 });
 
-// Modificar la función para guardar automáticamente en comparison.json
-async function compareLocalAndRemoteData() {
-    const remoteUrl = "https://raw.githubusercontent.com/supportcasafresca-cpu/Analytics-Casa-Fresca/refs/heads/main/Json/my_data.json";
-    const comparisonFilePath = path.join(directoryPath, "comparison.json");
-    let newOrders = [];
-    let release;
-
+app.get('/api/render-metrics', async (req, res) => {
     try {
-        // Leer datos locales
-        const localData = JSON.parse(await fs.promises.readFile(filePath, "utf8"));
-
-        // Obtener datos remotos (caché corta de 8s): evita golpear el CDN
-        // de GitHub varias veces casi al mismo tiempo cuando coinciden el
-        // polling de 30s, la carga de "/" y un pedido entrante.
-        const remoteData = await getOrSetCache('remote-orders-json', CACHE_TTL.REMOTE_ORDERS, async () => {
-            const response = await fetch(remoteUrl);
-            if (!response.ok) {
-                throw new Error(`Error al obtener datos remotos: ${response.statusText}`);
-            }
-            return response.json();
-        });
-
-        // Filtrar pedidos nuevos
-        newOrders = localData.filter(localItem => {
-            const isOrder = Array.isArray(localItem.compras) && localItem.compras.length > 0;
-            if (!isOrder) return false;
-
-            return !remoteData.some(remoteItem => (
-                Array.isArray(remoteItem.compras) && remoteItem.compras.length > 0 &&
-                remoteItem.ip === localItem.ip &&
-                remoteItem.fecha_hora_entrada === localItem.fecha_hora_entrada
-            ));
-        });
-
-        addLog(`Pedidos nuevos encontrados: ${newOrders.length}`);
-
-        // Guardar los nuevos pedidos en comparison.json
-        release = await lockfile.lock(comparisonFilePath);
-        addLog(`Archivo comparison.json bloqueado para escritura: ${comparisonFilePath}`);
-
-        await fs.promises.writeFile(
-            comparisonFilePath,
-            JSON.stringify(newOrders, null, 2),
-            "utf8"
-        );
-        addLog(`Datos de comparación guardados en: ${comparisonFilePath}`);
-
-        return newOrders;
-    } catch (error) {
-        addLog(`ERROR: No se pudo comparar datos locales y remotos: ${error.message}`);
-        throw error;
-    } finally {
-        if (release) release(); // Liberar el bloqueo del archivo
-    }
-}
-
-// Ruta para actualizar la comparación de datos y guardar en comparison.json
-app.post("/api/update-comparison", async (req, res) => {
-    const comparisonFilePath = path.join(directoryPath, "comparison.json");
-    let release;
-
-    try {
-        const newOrders = await compareLocalAndRemoteData();
-
-        // Bloquear el archivo comparison.json
-        release = await lockfile.lock(comparisonFilePath);
-        addLog(`Archivo bloqueado para escritura: ${comparisonFilePath}`);
-
-        // Guardar los nuevos pedidos en comparison.json
-        await fs.promises.writeFile(
-            comparisonFilePath,
-            JSON.stringify(newOrders, null, 2),
-            "utf8"
-        );
-        addLog(`Datos de comparación guardados en: ${comparisonFilePath}`);
-
-        // Responder con los nuevos pedidos
-        res.json({ success: true, newOrders });
-    } catch (error) {
-        addLog(`ERROR: No se pudo actualizar la comparación: ${error.message}`);
-        res.status(500).json({ success: false, error: error.message });
-    } finally {
-        if (release) release(); // Liberar el bloqueo del archivo
+        const summary = await getRenderMetricsSummary();
+        setPublicCacheHeaders(res, 60, 300);
+        return res.json({ success: true, ...summary });
+    } catch (err) {
+        addLog(`ERROR /api/render-metrics: ${err.message}`);
+        return res.status(500).json({ success: false, available: false, message: err.message });
     }
 });
 
-// Nueva ruta para limpiar estadísticas usando promesas
+app.get('/api/render/service', async (req, res) => {
+    try {
+        const info = await getRenderServiceInfo();
+        setPublicCacheHeaders(res, 60, 300);
+        return res.json({ success: true, ...info });
+    } catch (err) {
+        addLog(`ERROR /api/render/service: ${err.message}`);
+        return res.status(500).json({ success: false, available: false, message: err.message });
+    }
+});
+
+app.get('/api/render/deploys', async (req, res) => {
+    try {
+        const data = await getRenderDeploysList();
+        setPublicCacheHeaders(res, 30, 120);
+        return res.json({ success: true, ...data });
+    } catch (err) {
+        addLog(`ERROR /api/render/deploys: ${err.message}`);
+        return res.status(500).json({ success: false, available: false, message: err.message });
+    }
+});
+
+app.get('/api/render/events', async (req, res) => {
+    try {
+        const data = await getRenderEventsList();
+        setPublicCacheHeaders(res, 30, 120);
+        return res.json({ success: true, ...data });
+    } catch (err) {
+        addLog(`ERROR /api/render/events: ${err.message}`);
+        return res.status(500).json({ success: false, available: false, message: err.message });
+    }
+});
+
+// Uso/consumo de la cuenta de Cloudinary (Admin API). Solo accesible con
+// sesión de administrador válida (queda detrás del gate de requireAuth
+// porque este endpoint no está en PUBLIC_ROUTES). Se cachea 5 minutos para
+// no golpear el Admin API de Cloudinary en cada carga del panel.
+app.get('/api/admin/cloudinary-usage', async (req, res) => {
+    try {
+        if (!cloudinaryConfigured) {
+            return res.status(503).json({ success: false, message: 'Cloudinary no está configurado en el servidor.' });
+        }
+        const usage = await getOrSetCache('cloudinary:usage', CACHE_TTL.CLOUDINARY_USAGE, async () => {
+            return await cloudinary.api.usage();
+        });
+        return res.json({ success: true, usage });
+    } catch (error) {
+        addLog(`ERROR /api/admin/cloudinary-usage: ${error.message}`);
+        return res.status(500).json({ success: false, message: 'Error al obtener el uso de Cloudinary', error: error.message });
+    }
+});
+
+// Exporta la raíz de una RTDB, incluyendo sus prioridades, como JSON completo.
+// Esta ruta queda detrás del gate de requireAuth y no se añade a PUBLIC_ROUTES.
+app.get('/api/admin/rtdb-export/:database', requireAuth, async (req, res) => {
+    const database = req.params.database;
+    if (database !== 'principal' && database !== 'secundaria') {
+        return res.status(400).json({ success: false, message: 'Base de datos solicitada no válida.' });
+    }
+
+    const rtdbInstance = database === 'principal' ? rtdb : secondaryRtdb;
+    if (!rtdbInstance) {
+        return res.status(503).json({ success: false, message: 'La RTDB secundaria no está configurada en el servidor.' });
+    }
+
+    try {
+        const snapshot = await rtdbInstance.ref('/').once('value');
+        const exportJson = JSON.stringify(snapshot.exportVal(), null, 2);
+        res.set({
+            'Content-Type': 'application/json; charset=utf-8',
+            'Content-Disposition': `attachment; filename="rtdb-${database}.json"`,
+            'Cache-Control': 'private, no-store'
+        });
+        return res.send(exportJson);
+    } catch (error) {
+        addLog(`ERROR /api/admin/rtdb-export/${database}: ${error.message}`);
+        return res.status(500).json({ success: false, message: `Error al exportar la RTDB ${database}.` });
+    }
+});
+
+// Ruta para limpiar estadísticas (colección /estadisticas en la RTDB secundaria).
+// IMPORTANTE: esta ruta borra EXCLUSIVAMENTE el nodo /estadisticas. No toca
+// /pedidos, /pedidos_asignados, /client_order_index, /order_counter ni /known_ips
+// (que es lo que permite seguir marcando visitas como Recurrente/Único), ni la
+// RTDB principal (products, packs, server_health, admin_auth...). Queda detrás
+// del gate de requireAuth porque no está en PUBLIC_ROUTES.
 app.post("/api/clear-statistics", async (req, res) => {
     try {
         addLog("Solicitud para limpiar estadísticas recibida");
 
-        // Asegurar que el directorio existe
-        if (!fs.existsSync(directoryPath)) {
-            addLog("Directorio no encontrado. Creando directorio...");
-            await fs.promises.mkdir(directoryPath, { recursive: true });
-            addLog(`Directorio creado: ${directoryPath}`);
-        }
+        // Conteo previo solo para informar al panel de cuántos registros se
+        // borran (usa la caché de PUSH_LIST, no genera una lectura extra).
+        const statsAntes = await listUserStatisticsFromSecondary();
+        const total = Array.isArray(statsAntes) ? statsAntes.length : 0;
 
-        // Intentar borrar el archivo si existe
-        if (fs.existsSync(filePath)) {
-            addLog("Archivo de estadísticas encontrado. Eliminando archivo...");
-            await fs.promises.unlink(filePath);
-            addLog("Archivo de estadísticas eliminado");
-        } else {
-            addLog("Archivo de estadísticas no encontrado. Se creará uno nuevo.");
-        }
+        await clearUserStatistics();
+        addLog(`Colección /estadisticas reiniciada en Firebase RTDB (${total} registro(s) eliminados). Intactos: pedidos, pedidos_asignados, order_counter, client_order_index, known_ips, products y packs.`);
 
-        // Crear nuevo archivo con array vacío
-        addLog("Creando nuevo archivo de estadísticas...");
-        await fs.promises.writeFile(filePath, "[]", { 
-            encoding: 'utf8',
-            mode: 0o666 // Permisos de lectura y escritura para todos
-        });
-        addLog("Nuevo archivo de estadísticas creado correctamente");
-
-        // Invalidar caché del remoto: tras un reset manual queremos datos
-        // frescos sí o sí, no la última copia cacheada.
-        cacheDel('remote-orders-json');
-
-        // Comparar datos locales y remotos después de limpiar estadísticas
-        const newOrders = await compareLocalAndRemoteData();
-
-        res.json({ 
-            success: true, 
-            message: "Estadísticas limpiadas correctamente", 
-            newOrders 
+        res.json({
+            success: true,
+            message: `Estadísticas limpiadas correctamente (${total} registro${total === 1 ? '' : 's'} eliminado${total === 1 ? '' : 's'}).`,
+            nodo: ESTADISTICAS_RTDB_PATH,
+            eliminados: total,
+            conservados: [
+                'pedidos',
+                'pedidos_asignados',
+                'order_counter',
+                'client_order_index',
+                'known_ips',
+                'products',
+                'packs'
+            ]
         });
 
     } catch (error) {
         const errorMessage = `Error al limpiar estadísticas: ${error.message}`;
         addLog(`ERROR: ${errorMessage}`);
         console.error(errorMessage);
+        if (error.message && error.message.includes('instancia secundaria de Firebase RTDB')) {
+            return res.status(503).json({ success: false, error: errorMessage });
+        }
         res.status(500).json({ 
             success: false, 
             error: errorMessage 
@@ -849,102 +3564,1224 @@ app.post("/api/clear-statistics", async (req, res) => {
     }
 });
 
-// Ruta para obtener los datos actuales de comparison.json
-app.get("/api/get-comparison", async (req, res) => {
-    const comparisonFilePath = path.join(directoryPath, "comparison.json");
-
+// =====================================================
+// 📦 CRUD DE PRODUCTOS (catálogo real de la tienda, RTDB principal /products)
+// =====================================================
+app.get('/api/products', async (req, res) => {
     try {
-        // Leer los datos de comparison.json
-        const data = await fs.promises.readFile(comparisonFilePath, "utf8");
-        const comparisonData = JSON.parse(data);
-
-        setPublicCacheHeaders(res, 5, 30);
-        res.json({ success: true, comparisonData });
+        const productMap = await getSecondaryProductMap();
+        setPublicCacheHeaders(res, 60, 300);
+        const products = Object.values(productMap).map(product => addImageUrls(product, CLOUDINARY_PRODUCTS_FOLDER));
+        return res.json({ success: true, products });
     } catch (error) {
-        addLog(`ERROR: No se pudo leer comparison.json: ${error.message}`);
-        res.status(500).json({ success: false, error: "Error al obtener los datos de comparación" });
+        return res.status(500).json({ success: false, message: 'Error al obtener productos', error: error.message });
     }
 });
 
-// Endpoint para obtener los pedidos nuevos desde comparison.json
-app.get('/api/new-orders', async (req, res) => {
-    const comparisonFilePath = path.join(directoryPath, "comparison.json");
+app.get('/api/products/:id', async (req, res) => {
     try {
+        const { id } = req.params;
+        const productMap = await getSecondaryProductMap();
+        const product = productMap[id] || Object.values(productMap).find(item => item && item.id === id);
+        if (!product) {
+            return res.status(404).json({ success: false, message: 'Producto no encontrado.' });
+        }
+
+        setPublicCacheHeaders(res, 60, 300);
+        return res.json({ success: true, product: addImageUrls(product, CLOUDINARY_PRODUCTS_FOLDER) });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener el producto', error: error.message });
+    }
+});
+
+app.post('/api/products', async (req, res) => {
+    try {
+        const body = req.body || {};
+        if (!body.nombre) {
+            return res.status(400).json({ success: false, message: 'El campo "nombre" es obligatorio.' });
+        }
+
+        // Sube a Cloudinary cualquier imagen nueva (data URI o URL) recibida
+        // en "imagenes"; conserva tal cual los public_id ya existentes.
+        const imagenesProcesadas = await processProductImages(body.imagenes, [], CLOUDINARY_PRODUCTS_FOLDER);
+        const incoming = normalizeProductPayload({ ...body, imagenes: imagenesProcesadas });
+
+        const productMap = await getSecondaryProductMap();
+        productMap[incoming.id] = incoming;
+        await persistSecondaryProductMap(productMap);
+
+        return res.status(201).json({ success: true, product: incoming, products: Object.values(productMap) });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al crear el producto', error: error.message });
+    }
+});
+
+app.patch('/api/products/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const productMap = await getSecondaryProductMap();
+        const existing = productMap[id] || Object.values(productMap).find(item => item && item.id === id);
+        if (!existing) {
+            return res.status(404).json({ success: false, message: 'Producto no encontrado.' });
+        }
+
+        const body = { ...req.body || {} };
+        if (body.imagenes !== undefined) {
+            const oldImages = Array.isArray(existing.imagenes) ? existing.imagenes : [];
+            body.imagenes = await processProductImages(body.imagenes, oldImages, CLOUDINARY_PRODUCTS_FOLDER);
+            const newImages = Array.isArray(body.imagenes) ? body.imagenes : [];
+            const imagesToDelete = oldImages.filter(oldId => oldId && !newImages.includes(oldId));
+            await Promise.all(imagesToDelete.map(publicId => cloudinaryDeleteProductImage(publicId, CLOUDINARY_PRODUCTS_FOLDER)));
+        }
+
+        const updatedProduct = {
+            ...existing,
+            ...normalizeProductPayload({ ...existing, ...body, id: existing.id }),
+            id: existing.id,
+            fecha_actualizacion: nowInTimeZone('America/Havana')
+        };
+
+        // Si el producto quedó marcado como disponible/activo en este PATCH,
+        // limpiamos el flag de "desactivado_por_stock" para que deje de
+        // mostrarse como auto-desactivado en el panel.
+        if (updatedProduct.activo === true && updatedProduct.disponibilidad === true) {
+            updatedProduct.desactivado_por_stock = false;
+        }
+
+        productMap[existing.id] = updatedProduct;
+        await persistSecondaryProductMap(productMap);
+        return res.json({ success: true, product: updatedProduct, products: Object.values(productMap) });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al actualizar el producto', error: error.message });
+    }
+});
+
+app.delete('/api/products/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const productMap = await getSecondaryProductMap();
+        const existed = productMap[id] || Object.values(productMap).find(item => item && item.id === id);
+        if (!existed) {
+            return res.status(404).json({ success: false, message: 'Producto no encontrado.' });
+        }
+
+        // Eliminar también las imágenes del producto en Cloudinary (best-effort)
+        const imagenesAEliminar = Array.isArray(existed.imagenes) ? existed.imagenes : [];
+        await Promise.all(imagenesAEliminar.map(publicId => cloudinaryDeleteProductImage(publicId, CLOUDINARY_PRODUCTS_FOLDER)));
+
+        delete productMap[id];
+        await persistSecondaryProductMap(productMap);
+        return res.json({ success: true, deletedId: id, products: Object.values(productMap) });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al eliminar el producto', error: error.message });
+    }
+});
+
+app.post('/api/products/:id/images', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { imagenes, action = 'replace' } = req.body || {};
+        const productMap = await getSecondaryProductMap();
+        const existing = productMap[id] || Object.values(productMap).find(item => item && item.id === id);
+        if (!existing) {
+            return res.status(404).json({ success: false, message: 'Producto no encontrado.' });
+        }
+
+        // Sube a Cloudinary las imágenes nuevas (data URI o URL)
+        const uploaded = await processProductImages(imagenes, [], CLOUDINARY_PRODUCTS_FOLDER);
+
+        if (action === 'replace') {
+            // Si se reemplazan todas las imágenes, borra de Cloudinary las anteriores
+            const anteriores = Array.isArray(existing.imagenes) ? existing.imagenes : [];
+            await Promise.all(anteriores.map(publicId => cloudinaryDeleteProductImage(publicId, CLOUDINARY_PRODUCTS_FOLDER)));
+        }
+
+        const nextImages = action === 'append'
+            ? [...(existing.imagenes || []), ...uploaded]
+            : uploaded;
+
+        existing.imagenes = nextImages;
+        existing.fecha_actualizacion = nowInTimeZone('America/Havana');
+        productMap[existing.id] = existing;
+        await persistSecondaryProductMap(productMap);
+
+        return res.json({ success: true, product: existing, images: existing.imagenes });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al actualizar imágenes del producto', error: error.message });
+    }
+});
+
+app.delete('/api/products/:id/images/:index', async (req, res) => {
+    try {
+        const { id, index } = req.params;
+        const productMap = await getSecondaryProductMap();
+        const existing = productMap[id] || Object.values(productMap).find(item => item && item.id === id);
+        if (!existing) {
+            return res.status(404).json({ success: false, message: 'Producto no encontrado.' });
+        }
+
+        const imageIndex = Number(index);
+        if (!Number.isInteger(imageIndex) || imageIndex < 0 || imageIndex >= (existing.imagenes || []).length) {
+            return res.status(400).json({ success: false, message: 'Índice de imagen inválido.' });
+        }
+
+        const [publicIdEliminado] = existing.imagenes.splice(imageIndex, 1);
+        await cloudinaryDeleteProductImage(publicIdEliminado, CLOUDINARY_PRODUCTS_FOLDER);
+
+        existing.fecha_actualizacion = nowInTimeZone('America/Havana');
+        productMap[existing.id] = existing;
+        await persistSecondaryProductMap(productMap);
+        return res.json({ success: true, product: existing, images: existing.imagenes });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al eliminar la imagen del producto', error: error.message });
+    }
+});
+
+// =====================================================
+// 📦 CRUD NATIVO DE PACKS (RTDB principal, nodo "packs")
+// Misma estructura y comportamiento que /api/products.
+// =====================================================
+
+app.get('/api/packs', async (req, res) => {
+    try {
+        const packMap = await getPackMap();
+        setPublicCacheHeaders(res, 60, 300);
+        const packs = Object.values(packMap).map(pack => addImageUrls(pack, CLOUDINARY_PACKS_FOLDER));
+        return res.json({ success: true, packs });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener packs', error: error.message });
+    }
+});
+
+// =====================================================
+// 🟢 SSE: STREAM EN TIEMPO REAL (solo lectura, proxy desde RTDB)
+// Endpoint: GET /api/stream/:pathKey
+// ADITIVO: no modifica endpoints existentes ni lógica actual.
+// =====================================================
+
+// Mapeo de rutas permitidas para SSE y modo (delta | full)
+const SSE_ALLOWED_PATHS = {
+    'products': { path: 'products', mode: 'delta' },
+    'packs': { path: 'packs', mode: 'delta' },
+    'notification-banner': { path: NOTIFICATION_BANNER_PATH, mode: 'full' },
+    'afiliados': { path: 'afiliados', mode: 'full' },
+    'mensajes': { path: 'mensajes', mode: 'full' },
+    'evento': { path: 'evento', mode: 'full' },
+    'info': { path: 'info', mode: 'full' },
+    'pay': { path: 'pay', mode: 'full' }
+};
+
+// Contadores de conexiones por clave y total
+const sseConnectionCounts = new Map();
+let totalSseConnections = 0;
+
+app.get('/api/stream/:pathKey', async (req, res) => {
+    try {
+        if (IS_SERVERLESS) {
+            return res.status(501).json({
+                success: false,
+                message: 'Streaming en tiempo real (SSE) no está disponible en este despliegue serverless. Usa polling sobre el endpoint REST equivalente (ya cacheado).',
+                pollInstead: true
+            });
+        }
+
+        const { pathKey } = req.params || {};
+        const cfg = SSE_ALLOWED_PATHS[pathKey];
+        if (!cfg) {
+            return res.status(404).json({ success: false, message: 'Path no permitido para streaming.' });
+        }
+
+        // Límite global de conexiones SSE
+        if (totalSseConnections >= 10) {
+            return res.status(429).json({ success: false, message: 'Demasiadas conexiones en tiempo real activas, intenta más tarde.' });
+        }
+
+        // Marcar nueva conexión
+        sseConnectionCounts.set(pathKey, (sseConnectionCounts.get(pathKey) || 0) + 1);
+        totalSseConnections += 1;
+
+        // Cabeceras SSE
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        // Enviar cabeceras inmediatamente
+        if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+        const rtdbPath = cfg.path;
+        const mode = cfg.mode;
+        const ref = rtdb.ref(rtdbPath);
+
+        // Guardar listeners para poder hacer off() al cerrar
+        const listeners = [];
+
+        const sendError = (err) => {
+            try {
+                const msg = (err && err.message) ? err.message : String(err || 'unknown');
+                res.write(`event: error\ndata: ${JSON.stringify({ message: msg })}\n\n`);
+            } catch (e) { /* swallow */ }
+        };
+
+        if (mode === 'full') {
+            const onValue = (snapshot) => {
+                try {
+                    const payload = { path: rtdbPath, value: snapshot.val() };
+                    res.write(`event: full\ndata: ${JSON.stringify(payload)}\n\n`);
+                } catch (err) {
+                    sendError(err);
+                }
+            };
+            const onError = (err) => sendError(err);
+            ref.on('value', onValue, onError);
+            listeners.push({ ev: 'value', fn: onValue });
+            listeners.push({ ev: 'error', fn: onError });
+        } else {
+            // delta mode: child_added, child_changed, child_removed
+            const onChildUpsert = (snapshot) => {
+                try {
+                    const payload = { path: rtdbPath, key: snapshot.key, value: snapshot.val() };
+                    res.write(`event: child_upsert\ndata: ${JSON.stringify(payload)}\n\n`);
+                } catch (err) {
+                    sendError(err);
+                }
+            };
+
+            const onChildRemoved = (snapshot) => {
+                try {
+                    const payload = { path: rtdbPath, key: snapshot.key };
+                    res.write(`event: child_removed\ndata: ${JSON.stringify(payload)}\n\n`);
+                } catch (err) {
+                    sendError(err);
+                }
+            };
+
+            const onError = (err) => sendError(err);
+
+            ref.on('child_added', onChildUpsert, onError);
+            ref.on('child_changed', onChildUpsert, onError);
+            ref.on('child_removed', onChildRemoved, onError);
+
+            listeners.push({ ev: 'child_added', fn: onChildUpsert });
+            listeners.push({ ev: 'child_changed', fn: onChildUpsert });
+            listeners.push({ ev: 'child_removed', fn: onChildRemoved });
+            listeners.push({ ev: 'error', fn: onError });
+        }
+
+        // Ping mínimo para mantener la conexión viva sin mucho tráfico
+        const pingInterval = setInterval(() => {
+            try { res.write(': ping\n\n'); } catch (e) { /* swallow */ }
+        }, 45000);
+
+        // Cuando el cliente cierra la conexión
+        req.on('close', () => {
+            try {
+                clearInterval(pingInterval);
+
+                // Remover listeners registrados
+                try {
+                    listeners.forEach(l => {
+                        try { ref.off(l.ev, l.fn); } catch (e) { /* ignore */ }
+                    });
+                    // también asegurar off global
+                    try { ref.off(); } catch (e) { /* ignore */ }
+                } catch (e) { /* ignore */ }
+
+                // Actualizar contadores
+                sseConnectionCounts.set(pathKey, Math.max(0, (sseConnectionCounts.get(pathKey) || 1) - 1));
+                totalSseConnections = Math.max(0, totalSseConnections - 1);
+            } catch (err) {
+                // nada
+            }
+        });
+
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error inicializando stream SSE', error: error.message });
+    }
+});
+
+app.get('/api/packs/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const packMap = await getPackMap();
+        const pack = packMap[id] || Object.values(packMap).find(item => item && item.id === id);
+        if (!pack) {
+            return res.status(404).json({ success: false, message: 'Pack no encontrado.' });
+        }
+
+        setPublicCacheHeaders(res, 60, 300);
+        return res.json({ success: true, pack: addImageUrls(pack, CLOUDINARY_PACKS_FOLDER) });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener el pack', error: error.message });
+    }
+});
+
+app.post('/api/packs', async (req, res) => {
+    try {
+        const body = req.body || {};
+        if (!body.nombre) {
+            return res.status(400).json({ success: false, message: 'El campo "nombre" es obligatorio.' });
+        }
+
+        // Sube a Cloudinary cualquier imagen nueva (data URI o URL) recibida
+        // en "imagenes"; conserva tal cual los public_id ya existentes.
+        const imagenesProcesadas = await processProductImages(body.imagenes, [], CLOUDINARY_PACKS_FOLDER);
+        const incoming = normalizePackPayload({ ...body, imagenes: imagenesProcesadas });
+
+        const packMap = await getPackMap();
+        packMap[incoming.id] = incoming;
+        await persistPackMap(packMap);
+
+        return res.status(201).json({ success: true, pack: incoming, packs: Object.values(packMap) });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al crear el pack', error: error.message });
+    }
+});
+
+async function actualizarPackHandler(req, res) {
+    try {
+        const { id } = req.params;
+        const packMap = await getPackMap();
+        const existing = packMap[id] || Object.values(packMap).find(item => item && item.id === id);
+        if (!existing) {
+            return res.status(404).json({ success: false, message: 'Pack no encontrado.' });
+        }
+
+        const body = { ...req.body || {} };
+        if (body.imagenes !== undefined) {
+            const oldImages = Array.isArray(existing.imagenes) ? existing.imagenes : [];
+            body.imagenes = await processProductImages(body.imagenes, oldImages, CLOUDINARY_PACKS_FOLDER);
+            const newImages = Array.isArray(body.imagenes) ? body.imagenes : [];
+            const imagesToDelete = oldImages.filter(oldId => oldId && !newImages.includes(oldId));
+            await Promise.all(imagesToDelete.map(publicId => cloudinaryDeleteProductImage(publicId, CLOUDINARY_PACKS_FOLDER)));
+        }
+
+        const updatedPack = {
+            ...existing,
+            ...normalizePackPayload({ ...existing, ...body, id: existing.id }),
+            id: existing.id,
+            fecha_actualizacion: nowInTimeZone('America/Havana')
+        };
+
+        packMap[existing.id] = updatedPack;
+        await persistPackMap(packMap);
+        return res.json({ success: true, pack: updatedPack, packs: Object.values(packMap) });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al actualizar el pack', error: error.message });
+    }
+}
+app.patch('/api/packs/:id', actualizarPackHandler);
+app.put('/api/packs/:id', actualizarPackHandler);
+
+app.delete('/api/packs/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const packMap = await getPackMap();
+        const existed = packMap[id] || Object.values(packMap).find(item => item && item.id === id);
+        if (!existed) {
+            return res.status(404).json({ success: false, message: 'Pack no encontrado.' });
+        }
+
+        // Eliminar también las imágenes del pack en Cloudinary (best-effort)
+        const imagenesAEliminar = Array.isArray(existed.imagenes) ? existed.imagenes : [];
+        await Promise.all(imagenesAEliminar.map(publicId => cloudinaryDeleteProductImage(publicId, CLOUDINARY_PACKS_FOLDER)));
+
+        delete packMap[id];
+        await persistPackMap(packMap);
+        return res.json({ success: true, deletedId: id, packs: Object.values(packMap) });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al eliminar el pack', error: error.message });
+    }
+});
+
+app.post('/api/packs/:id/images', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { imagenes, action = 'replace' } = req.body || {};
+        const packMap = await getPackMap();
+        const existing = packMap[id] || Object.values(packMap).find(item => item && item.id === id);
+        if (!existing) {
+            return res.status(404).json({ success: false, message: 'Pack no encontrado.' });
+        }
+
+        // Sube a Cloudinary las imágenes nuevas (data URI o URL)
+        const uploaded = await processProductImages(imagenes, [], CLOUDINARY_PACKS_FOLDER);
+
+        if (action === 'replace') {
+            // Si se reemplazan todas las imágenes, borra de Cloudinary las anteriores
+            const anteriores = Array.isArray(existing.imagenes) ? existing.imagenes : [];
+            await Promise.all(anteriores.map(publicId => cloudinaryDeleteProductImage(publicId, CLOUDINARY_PACKS_FOLDER)));
+        }
+
+        const nextImages = action === 'append'
+            ? [...(existing.imagenes || []), ...uploaded]
+            : uploaded;
+
+        existing.imagenes = nextImages;
+        existing.fecha_actualizacion = nowInTimeZone('America/Havana');
+        packMap[existing.id] = existing;
+        await persistPackMap(packMap);
+
+        return res.json({ success: true, pack: existing, images: existing.imagenes });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al actualizar imágenes del pack', error: error.message });
+    }
+});
+
+app.delete('/api/packs/:id/images/:index', async (req, res) => {
+    try {
+        const { id, index } = req.params;
+        const packMap = await getPackMap();
+        const existing = packMap[id] || Object.values(packMap).find(item => item && item.id === id);
+        if (!existing) {
+            return res.status(404).json({ success: false, message: 'Pack no encontrado.' });
+        }
+
+        const imageIndex = Number(index);
+        if (!Number.isInteger(imageIndex) || imageIndex < 0 || imageIndex >= (existing.imagenes || []).length) {
+            return res.status(400).json({ success: false, message: 'Índice de imagen inválido.' });
+        }
+
+        const [publicIdEliminado] = existing.imagenes.splice(imageIndex, 1);
+        await cloudinaryDeleteProductImage(publicIdEliminado, CLOUDINARY_PACKS_FOLDER);
+
+        existing.fecha_actualizacion = nowInTimeZone('America/Havana');
+        packMap[existing.id] = existing;
+        await persistPackMap(packMap);
+        return res.json({ success: true, pack: existing, images: existing.imagenes });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al eliminar la imagen del pack', error: error.message });
+    }
+});
+
+// Endpoint para obtener los pedidos nuevos desde la colección secundaria de Firebase.
+app.get('/api/new-orders', async (req, res) => {
+    try {
+        if (secondaryRtdb) {
+            const newOrders = await listSecondaryOrdersByBranch('new');
+            return sendJsonSmart(req, res, { success: true, newOrders }, { maxAge: 15 });
+        }
+
         if (!fs.existsSync(comparisonFilePath)) {
-            setPublicCacheHeaders(res, 5, 30);
-            return res.json({ success: true, newOrders: [] });
+            return sendJsonSmart(req, res, { success: true, newOrders: [] }, { maxAge: 15 });
         }
         const data = await fs.promises.readFile(comparisonFilePath, 'utf8');
         const newOrders = JSON.parse(data);
-        setPublicCacheHeaders(res, 5, 30);
-        res.json({ success: true, newOrders });
+        return sendJsonSmart(req, res, { success: true, newOrders }, { maxAge: 15 });
     } catch (error) {
         console.error('Error al leer comparison.json:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// Modificar la ruta principal para verificar pedidos nuevos al cargar la página
-app.get("/", async (req, res) => {
-    addLog("Página principal solicitada");
+app.get('/api/orders/managed', async (req, res) => {
+    try {
+        const orders = secondaryRtdb ? await listSecondaryOrdersByBranch('managed') : [];
+        return sendJsonSmart(req, res, { success: true, orders }, { maxAge: 15 });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener pedidos gestionados', error: error.message });
+    }
+});
+
+app.get('/api/orders/managed/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const orders = secondaryRtdb ? await listSecondaryOrdersByBranch('managed') : [];
+        const order = orders.find(item => item.id === id);
+        if (!order) {
+            return res.status(404).json({ success: false, message: 'Pedido gestionado no encontrado.' });
+        }
+        return res.json({ success: true, order });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener el pedido gestionado', error: error.message });
+    }
+});
+
+app.post('/api/orders/managed', async (req, res) => {
+    const payload = req.body || {};
+    const created = normalizeManagedOrderPayload(payload);
+    if (!created.nombre_cliente || !created.telefono) {
+        return res.status(400).json({ success: false, message: 'Los campos "nombre_cliente" y "telefono" son obligatorios.' });
+    }
 
     try {
-        // Verificar si hay pedidos nuevos
-        const newOrders = await compareLocalAndRemoteData();
+        const orders = secondaryRtdb ? await listSecondaryOrdersByBranch('managed') : [];
+        orders.push(created);
+        if (secondaryRtdb) {
+            await writeSecondaryOrdersByBranch('managed', orders);
+            return res.status(201).json({ success: true, order: created, orders });
+        }
+        return res.status(503).json({ success: false, message: 'La instancia secundaria de Firebase RTDB no está disponible para pedidos gestionados.' });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al crear pedido gestionado', error: error.message });
+    }
+});
 
-        // Si hay nuevos pedidos, guardar estadísticas y mostrar el botón
-        if (newOrders.length > 0) {
-            addLog(`Se encontraron ${newOrders.length} nuevos pedidos al cargar la página.`);
-
-            // Guardar estadísticas de los nuevos pedidos
-            const estadisticas = JSON.parse(await fs.promises.readFile(filePath, "utf8"));
-            newOrders.forEach(order => {
-                estadisticas.push(order);
-            });
-            await fs.promises.writeFile(filePath, JSON.stringify(estadisticas, null, 2), "utf8");
-            addLog("Estadísticas de nuevos pedidos guardadas correctamente.");
+app.patch('/api/orders/managed/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const orders = secondaryRtdb ? await listSecondaryOrdersByBranch('managed') : [];
+        const index = orders.findIndex(item => item.id === id);
+        if (index === -1) {
+            return res.status(404).json({ success: false, message: 'Pedido gestionado no encontrado.' });
         }
 
-        // Enviar el archivo HTML con información sobre nuevos pedidos
-        res.sendFile(__dirname + '/public/index.html', {
-            headers: {
-                'X-New-Orders': newOrders.length > 0 ? 'true' : 'false'
+        const updatedOrder = {
+            ...orders[index],
+            ...req.body,
+            id,
+            fecha_actualizacion: nowInTimeZone('America/Havana')
+        };
+        orders[index] = updatedOrder;
+
+        if (secondaryRtdb) {
+            await writeSecondaryOrdersByBranch('managed', orders);
+            return res.json({ success: true, order: updatedOrder, orders });
+        }
+
+        return res.status(503).json({ success: false, message: 'La instancia secundaria de Firebase RTDB no está disponible para pedidos gestionados.' });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al actualizar el pedido gestionado', error: error.message });
+    }
+});
+
+app.delete('/api/orders/managed/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const orders = secondaryRtdb ? await listSecondaryOrdersByBranch('managed') : [];
+        const existing = orders.find(item => item.id === id);
+        if (!existing) {
+            return res.status(404).json({ success: false, message: 'Pedido gestionado no encontrado.' });
+        }
+
+        const filtered = orders.filter(item => item.id !== id);
+        if (secondaryRtdb) {
+            await writeSecondaryOrdersByBranch('managed', filtered);
+            return res.json({ success: true, deletedId: id, orders: filtered });
+        }
+
+        return res.status(503).json({ success: false, message: 'La instancia secundaria de Firebase RTDB no está disponible para pedidos gestionados.' });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al eliminar el pedido gestionado', error: error.message });
+    }
+});
+
+// Endpoint para eliminar (descartar) un único pedido nuevo sin guardar.
+app.delete('/api/new-orders', async (req, res) => {
+    let release;
+    try {
+        const { ip, fecha_hora_entrada } = req.body || {};
+
+        if (!ip || !fecha_hora_entrada) {
+            return res.status(400).json({
+                success: false,
+                message: 'Se requieren los campos "ip" y "fecha_hora_entrada" para identificar el pedido a eliminar.'
+            });
+        }
+
+        const key = buildOrderKey({ ip, fecha_hora_entrada });
+
+        if (secondaryRtdb) {
+            const currentOrders = await listSecondaryOrdersByBranch('new');
+            const pedidoDescartado = currentOrders.find(order => buildOrderKey(order) === key);
+            const existiaPedido = Boolean(pedidoDescartado);
+            const updatedOrders = currentOrders.filter(order => buildOrderKey(order) !== key);
+            await writeSecondaryOrdersByBranch('new', updatedOrders);
+            await writeSecondaryNode('orders/dismissed', await readSecondaryNode('orders/dismissed', []));
+            const dismissed = await readSecondaryNode('orders/dismissed', []);
+            if (!dismissed.some(item => item === key)) {
+                dismissed.push(key);
+                await writeSecondaryNode('orders/dismissed', dismissed);
             }
+
+            // Devolver al stock los productos con "aplicar_stock" habilitado
+            // que traía este pedido, ya que se está descartando/cancelando.
+            // Solo se intenta si el pedido realmente estaba en la lista (evita
+            // reprocesar y sumar stock de más si el descarte se repite).
+            if (existiaPedido && pedidoDescartado.stock_decrementado === true && Array.isArray(pedidoDescartado.compras) && pedidoDescartado.compras.length > 0) {
+                try {
+                    const resultadoStock = await restaurarStockPorCompras(pedidoDescartado.compras);
+                    if (resultadoStock.actualizado) {
+                        addLog(`Stock restaurado por pedido descartado (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}): ${JSON.stringify(resultadoStock.afectados)}`);
+                    }
+                    if (!resultadoStock.exitoso) {
+                        addLog(`ERROR: la restauración de stock del pedido descartado (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}) quedó incompleta. noEncontrados: ${JSON.stringify(resultadoStock.noEncontrados)}, fallidos: ${JSON.stringify(resultadoStock.fallidos)}`);
+                    }
+                } catch (stockError) {
+                    addLog(`ERROR restaurando stock del pedido descartado (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}): ${stockError && stockError.message ? stockError.message : stockError}`);
+                }
+            }
+
+            return res.json({
+                success: true,
+                message: existiaPedido ? 'Pedido eliminado correctamente.' : 'El pedido ya no estaba en la lista, pero fue marcado como descartado.',
+                newOrders: updatedOrders
+            });
+        }
+
+        // Asegurar que el archivo de comparación existe antes de bloquearlo
+        if (!fs.existsSync(comparisonFilePath)) {
+            await fs.promises.writeFile(comparisonFilePath, JSON.stringify([], null, 2), 'utf8');
+        }
+
+        release = await lockfile.lock(comparisonFilePath);
+
+        const currentOrders = await readJsonFile(comparisonFilePath, []);
+        const pedidoDescartado = currentOrders.find(order => buildOrderKey(order) === key);
+        const existiaPedido = Boolean(pedidoDescartado);
+        const updatedOrders = currentOrders.filter(order => buildOrderKey(order) !== key);
+
+        await writeJsonFile(comparisonFilePath, updatedOrders);
+
+        // Registrar el pedido como descartado de forma permanente
+        await addDismissedOrder(key);
+
+        // Devolver al stock los productos con "aplicar_stock" habilitado
+        // que traía este pedido, ya que se está descartando/cancelando.
+        if (existiaPedido && pedidoDescartado.stock_decrementado === true && Array.isArray(pedidoDescartado.compras) && pedidoDescartado.compras.length > 0) {
+            try {
+                const resultadoStock = await restaurarStockPorCompras(pedidoDescartado.compras);
+                if (resultadoStock.actualizado) {
+                    addLog(`Stock restaurado por pedido descartado (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}): ${JSON.stringify(resultadoStock.afectados)}`);
+                }
+                if (!resultadoStock.exitoso) {
+                    addLog(`ERROR: la restauración de stock del pedido descartado (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}) quedó incompleta. noEncontrados: ${JSON.stringify(resultadoStock.noEncontrados)}, fallidos: ${JSON.stringify(resultadoStock.fallidos)}`);
+                }
+            } catch (stockError) {
+                addLog(`ERROR restaurando stock del pedido descartado (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}): ${stockError && stockError.message ? stockError.message : stockError}`);
+            }
+        }
+
+        addLog(`Pedido eliminado manualmente desde el panel (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}).`);
+
+        return res.json({
+            success: true,
+            message: existiaPedido ? 'Pedido eliminado correctamente.' : 'El pedido ya no estaba en la lista, pero fue marcado como descartado.',
+            newOrders: updatedOrders
         });
     } catch (error) {
-        addLog(`ERROR: No se pudo verificar pedidos nuevos al cargar la página: ${error.message}`);
-        res.status(500).send("Error interno del servidor");
+        addLog(`ERROR: No se pudo eliminar el pedido: ${error.message}`);
+        console.error('Error al eliminar pedido:', error);
+        return res.status(500).json({ success: false, message: 'Error interno al eliminar el pedido.', error: error.message });
+    } finally {
+        if (release) release();
     }
+});
+
+// =====================================================
+// 📋 GESTIÓN DE PEDIDOS (listado persistente independiente de /api/new-orders)
+// =====================================================
+// Estructura de cada pedido gestionado:
+// {
+//   id, nombre_cliente, pais, telefono, precio_total,
+//   aceptado, entregado, enviado_a_pagar, pagado, enviado_grupo_pagos,
+//   origen: "new-order" | "manual",
+//   source_key: "ip|fecha_hora_entrada" (solo si origen === "new-order"),
+//   fecha_creacion, fecha_actualizacion
+// }
+
+// GET /api/managed-orders → obtener el listado completo de gestión
+app.get('/api/managed-orders', async (req, res) => {
+    try {
+        const managedOrders = secondaryRtdb
+            ? await listSecondaryOrdersByBranch('managed')
+            : await readJsonFile(managedOrdersFilePath, []);
+        const { items, paginated, total, limit, offset } = paginateArray(managedOrders, req);
+        const payload = paginated
+            ? { success: true, managedOrders: items, total, limit, offset }
+            : { success: true, managedOrders: items };
+        return sendJsonSmart(req, res, payload, { maxAge: 15 });
+    } catch (error) {
+        addLog(`ERROR: No se pudo leer managed_orders.json: ${error.message}`);
+        res.status(500).json({ success: false, message: 'Error al obtener el listado de gestión', error: error.message });
+    }
+});
+
+// POST /api/managed-orders → agregar un pedido al listado de gestión.
+// Puede venir de un pedido nuevo (origen: "new-order", con sourceKey { ip, fecha_hora_entrada })
+// o ser creado manualmente (origen: "manual").
+app.post('/api/managed-orders', async (req, res) => {
+    let release;
+    try {
+        const {
+            nombre_cliente,
+            pais,
+            telefono,
+            precio_total,
+            origen,
+            sourceKey
+        } = req.body || {};
+
+        if (!nombre_cliente || !telefono) {
+            return res.status(400).json({
+                success: false,
+                message: 'Los campos "nombre_cliente" y "telefono" son obligatorios.'
+            });
+        }
+
+        if (!fs.existsSync(managedOrdersFilePath)) {
+            await fs.promises.writeFile(managedOrdersFilePath, JSON.stringify([], null, 2), 'utf8');
+        }
+
+        release = await lockfile.lock(managedOrdersFilePath);
+
+        const fechaActual = nowInTimeZone('America/Havana');
+
+        const nuevoPedidoGestionado = {
+            id: crypto.randomUUID(),
+            nombre_cliente: String(nombre_cliente),
+            pais: pais ? String(pais) : 'N/A',
+            telefono: String(telefono),
+            precio_total: precio_total !== undefined && precio_total !== null && precio_total !== '' ? Number(precio_total) : 0,
+            aceptado: false,
+            entregado: false,
+            enviado_a_pagar: false,
+            pagado: false,
+            enviado_grupo_pagos: false,
+            origen: origen === 'new-order' ? 'new-order' : 'manual',
+            source_key: origen === 'new-order' && sourceKey ? buildOrderKey(sourceKey) : null,
+            fecha_creacion: fechaActual,
+            fecha_actualizacion: fechaActual
+        };
+
+        if (secondaryRtdb) {
+            await setSecondaryOrderById('managed', nuevoPedidoGestionado.id, nuevoPedidoGestionado);
+        } else {
+            const managedOrders = await readJsonFile(managedOrdersFilePath, []);
+            managedOrders.push(nuevoPedidoGestionado);
+            await writeJsonFile(managedOrdersFilePath, managedOrders);
+        }
+
+        addLog(`Pedido agregado al listado de gestión: ${nuevoPedidoGestionado.nombre_cliente} (id: ${nuevoPedidoGestionado.id})`);
+
+        // Si el pedido proviene de la lista de pedidos nuevos, lo eliminamos de la colección secundaria
+        // para que no aparezca como pedido nuevo mientras está en seguimiento.
+        if (secondaryRtdb && origen === 'new-order' && sourceKey && sourceKey.ip && sourceKey.fecha_hora_entrada) {
+            try {
+                const key = buildOrderKey(sourceKey);
+                const currentOrders = await listSecondaryOrdersByBranch('new');
+                const updatedOrders = currentOrders.filter(order => buildOrderKey(order) !== key);
+                await writeSecondaryOrdersByBranch('new', updatedOrders);
+            } catch (dismissError) {
+                addLog(`WARN: No se pudo actualizar la colección secundaria de nuevos pedidos: ${dismissError.message}`);
+            }
+        }
+
+        if (!secondaryRtdb && origen === 'new-order' && sourceKey && sourceKey.ip && sourceKey.fecha_hora_entrada) {
+            try {
+                const key = buildOrderKey(sourceKey);
+                let releaseComparison;
+                if (!fs.existsSync(comparisonFilePath)) {
+                    await fs.promises.writeFile(comparisonFilePath, JSON.stringify([], null, 2), 'utf8');
+                }
+                releaseComparison = await lockfile.lock(comparisonFilePath);
+                try {
+                    const currentOrders = await readJsonFile(comparisonFilePath, []);
+                    const updatedOrders = currentOrders.filter(order => buildOrderKey(order) !== key);
+                    await writeJsonFile(comparisonFilePath, updatedOrders);
+                } finally {
+                    if (releaseComparison) releaseComparison();
+                }
+            } catch (dismissError) {
+                addLog(`WARN: No se pudo actualizar comparison.json tras agregar el pedido a gestión: ${dismissError.message}`);
+            }
+        }
+
+        res.json({ success: true, managedOrder: nuevoPedidoGestionado });
+    } catch (error) {
+        addLog(`ERROR: No se pudo agregar el pedido al listado de gestión: ${error.message}`);
+        res.status(500).json({ success: false, message: 'Error al agregar el pedido de gestión', error: error.message });
+    } finally {
+        if (release) release();
+    }
+});
+
+// PATCH /api/managed-orders/:id → actualizar campos de un pedido gestionado
+// (datos del cliente y/o estados: aceptado, entregado, enviado_a_pagar, pagado, enviado_grupo_pagos)
+app.patch('/api/managed-orders/:id', async (req, res) => {
+    let release;
+    try {
+        const { id } = req.params;
+        const camposPermitidos = [
+            'nombre_cliente', 'pais', 'telefono', 'precio_total',
+            'aceptado', 'entregado', 'enviado_a_pagar', 'pagado', 'enviado_grupo_pagos'
+        ];
+
+        const cambios = {};
+        for (const campo of camposPermitidos) {
+            if (Object.prototype.hasOwnProperty.call(req.body || {}, campo)) {
+                cambios[campo] = req.body[campo];
+            }
+        }
+
+        if (Object.keys(cambios).length === 0) {
+            return res.status(400).json({ success: false, message: 'No se proporcionaron campos válidos para actualizar.' });
+        }
+
+        if ('precio_total' in cambios) cambios.precio_total = Number(cambios.precio_total) || 0;
+        for (const flag of ['aceptado', 'entregado', 'enviado_a_pagar', 'pagado', 'enviado_grupo_pagos']) {
+            if (flag in cambios) cambios[flag] = Boolean(cambios[flag]);
+        }
+        cambios.fecha_actualizacion = nowInTimeZone('America/Havana');
+
+        if (secondaryRtdb) {
+            const existing = await getSecondaryOrderById('managed', id);
+            if (!existing) {
+                return res.status(404).json({ success: false, message: 'Pedido gestionado no encontrado.' });
+            }
+            const updated = await patchSecondaryOrderById('managed', id, cambios);
+            addLog(`Pedido gestionado actualizado (id: ${id}): ${JSON.stringify(cambios)}`);
+            return res.json({ success: true, managedOrder: updated });
+        }
+
+        release = await lockfile.lock(managedOrdersFilePath);
+        const managedOrders = await readJsonFile(managedOrdersFilePath, []);
+        const index = managedOrders.findIndex(order => order.id === id);
+        if (index === -1) {
+            return res.status(404).json({ success: false, message: 'Pedido gestionado no encontrado.' });
+        }
+        managedOrders[index] = { ...managedOrders[index], ...cambios };
+        await writeJsonFile(managedOrdersFilePath, managedOrders);
+        addLog(`Pedido gestionado actualizado (id: ${id}): ${JSON.stringify(cambios)}`);
+        res.json({ success: true, managedOrder: managedOrders[index] });
+    } catch (error) {
+        addLog(`ERROR: No se pudo actualizar el pedido gestionado: ${error.message}`);
+        res.status(500).json({ success: false, message: 'Error al actualizar el pedido gestionado', error: error.message });
+    } finally {
+        if (release) release();
+    }
+});
+
+// DELETE /api/managed-orders/:id → eliminar permanentemente un pedido del listado de gestión
+app.delete('/api/managed-orders/:id', async (req, res) => {
+    let release;
+    try {
+        const { id } = req.params;
+
+        if (secondaryRtdb) {
+            const existing = await getSecondaryOrderById('managed', id);
+            await deleteSecondaryOrderById('managed', id);
+            addLog(`Pedido eliminado del listado de gestión (id: ${id}).`);
+            return res.json({
+                success: true,
+                message: existing ? 'Pedido eliminado correctamente.' : 'El pedido ya no existía en el listado.'
+            });
+        }
+
+        release = await lockfile.lock(managedOrdersFilePath);
+        const managedOrders = await readJsonFile(managedOrdersFilePath, []);
+        const orderToRemove = managedOrders.find(order => order.id === id);
+        const updatedOrders = managedOrders.filter(order => order.id !== id);
+        await writeJsonFile(managedOrdersFilePath, updatedOrders);
+        addLog(`Pedido eliminado del listado de gestión (id: ${id}).`);
+        const existed = Boolean(orderToRemove);
+        res.json({
+            success: true,
+            message: existed ? 'Pedido eliminado correctamente.' : 'El pedido ya no existía en el listado.'
+        });
+    } catch (error) {
+        addLog(`ERROR: No se pudo eliminar el pedido gestionado: ${error.message}`);
+        res.status(500).json({ success: false, message: 'Error al eliminar el pedido gestionado', error: error.message });
+    } finally {
+        if (release) release();
+    }
+});
+
+// Ruta principal: sirve el HTML del panel estático.
+app.get("/", (req, res) => {
+    addLog("Página principal solicitada");
+    res.sendFile(__dirname + '/public/index.html');
 });
 
 // Manejo de errores
 app.use((err, req, res, next) => {
+    if (err && err.type === 'entity.too.large') {
+        addLog(`ERROR PAYLOAD: ${err.message}`);
+        return res.status(413).json({
+            success: false,
+            message: 'El cuerpo de la solicitud es demasiado grande. Reduce el tamaño o el número de imágenes e intenta nuevamente.'
+        });
+    }
+
     addLog(`ERROR GLOBAL: ${err.message}`);
     console.error("Error global:", err);
-    res.status(500).json({ error: "Error interno del servidor" });
+    res.status(500).json({ success: false, error: 'Error interno del servidor' });
 });
 
-// Puerto de escucha
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-    addLog(`Servidor corriendo en el puerto ${PORT}`);
-    addLog(`Entorno: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`Servidor corriendo en el puerto ${PORT}`);
-    console.log(`Entorno: ${process.env.NODE_ENV || 'development'}`);
+if (!IS_SERVERLESS) {
+    app.listen(PORT, () => {
+        addLog(`Servidor corriendo en el puerto ${PORT}`);
+        addLog(`Entorno: ${process.env.NODE_ENV || 'development'}`);
+        console.log(`Servidor corriendo en el puerto ${PORT}`);
+        console.log(`Entorno: ${process.env.NODE_ENV || 'development'}`);
+    });
+    setInterval(recordUptimeHeartbeat, UPTIME_HEARTBEAT_INTERVAL_MS);
+    recordUptimeHeartbeat();
+}
+
+module.exports = app;
+
+// Los ratings ahora se guardan directamente en Firebase Realtime Database,
+// en la ruta /ratings/{productId}/votes/{userHash} -> número de estrellas (1 a 5).
+// Esto reemplaza el Google Apps Script que se usaba antes (más lento y con más
+// posibilidad de error). Un mismo userHash solo puede tener UN voto por producto:
+// si vuelve a votar, se actualiza (no se duplica).
+
+// POST /rate-product
+app.post("/rate-product", rateLimitMiddleware, async (req, res) => {
+  try {
+    const { productId, rating, userHash } = req.body;
+    if (!productId || userHash === undefined || rating === undefined) {
+      return res.status(400).json({ success: false, message: "Faltan campos: productId, rating o userHash" });
+    }
+
+    // Validaciones básicas
+    const numericRating = Number(rating);
+    if (isNaN(numericRating) || numericRating < 0 || numericRating > 5) {
+      return res.status(400).json({ success: false, message: "Rating inválido" });
+    }
+
+    const safeProductId = String(productId);
+    const safeUserHash = String(userHash);
+
+    const voteRef = rtdb.ref(`ratings/${safeProductId}/votes/${safeUserHash}`);
+    const existingVoteSnap = await voteRef.once("value");
+    const action = existingVoteSnap.exists() ? "updated" : "created";
+    await voteRef.set(numericRating);
+
+    const allVotesSnap = await rtdb.ref(`ratings/${safeProductId}/votes`).once("value");
+    const allVotes = Object.values(allVotesSnap.val() || {});
+    const totalVotes = allVotes.length;
+    const avgRating = totalVotes > 0 ? allVotes.reduce((a, b) => a + b, 0) / totalVotes : 0;
+
+    cacheSet(`ratings:${safeProductId}`, { avgRating, totalVotes }, CACHE_TTL.RATINGS);
+    cacheDel('ratings-summary');
+
+    return res.json({
+      success: true,
+      productId: safeProductId,
+      userHash: safeUserHash,
+      rating: numericRating,
+      avgRating,
+      totalVotes,
+      action
+    });
+  } catch (err) {
+    console.error("Error /rate-product:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
 });
 
-// Verificar nuevos pedidos cada 30 segundos
-setInterval(async () => {
-    try {
-        const newOrders = await compareLocalAndRemoteData();
+// GET /product-ratings?productId=...
+app.get("/product-ratings", async (req, res) => {
+  try {
+    const productId = req.query.productId;
+    if (!productId) return res.status(400).json({ success: false, message: "productId requerido" });
 
-        if (newOrders.length > 0) {
-            addLog(`Se encontraron ${newOrders.length} nuevos pedidos en la verificación periódica.`);
-            // Llamamos a la notificación
-        } else {
-            addLog("No se encontraron nuevos pedidos en la verificación periódica.");
-        }
-    } catch (error) {
-        addLog(`ERROR: Error en la verificación periódica de nuevos pedidos: ${error.message}`);
+    const safeProductId = String(productId);
+    const { avgRating, totalVotes } = await getOrSetCache(`ratings:${safeProductId}`, CACHE_TTL.RATINGS, async () => {
+        const allVotesSnap = await rtdb.ref(`ratings/${safeProductId}/votes`).once("value");
+        const allVotes = Object.values(allVotesSnap.val() || {});
+        const total = allVotes.length;
+        const avg = total > 0 ? allVotes.reduce((a, b) => a + b, 0) / total : 0;
+        return { avgRating: avg, totalVotes: total };
+    });
+
+    setPublicCacheHeaders(res, 20, 60);
+    return res.json({
+      success: true,
+      productId: safeProductId,
+      avgRating,
+      totalVotes
+    });
+  } catch (err) {
+    console.error("Error /product-ratings:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+function buildRatingsSummaryFromTree(ratingsTree) {
+    const summary = {};
+    const tree = ratingsTree || {};
+    Object.keys(tree).forEach((productId) => {
+        const votes = Object.values((tree[productId] && tree[productId].votes) || {});
+        const totalVotes = votes.length;
+        const avgRating = totalVotes > 0 ? votes.reduce((a, b) => a + b, 0) / totalVotes : 0;
+        summary[productId] = { avgRating, totalVotes };
+    });
+    return summary;
+}
+
+async function getRatingsSummaryCached() {
+    return getOrSetCache('ratings-summary', CACHE_TTL.RATINGS, async () => {
+        const snapshot = await rtdb.ref('ratings').once('value');
+        return buildRatingsSummaryFromTree(snapshot.val());
+    });
+}
+
+app.get('/api/ratings-summary', async (req, res) => {
+    try {
+        const summary = await getRatingsSummaryCached();
+        setPublicCacheHeaders(res, 20, 60);
+        return res.json({ success: true, ratings: summary });
+    } catch (err) {
+        console.error('Error /api/ratings-summary:', err);
+        return res.status(500).json({ success: false, message: err.message });
     }
-}, 30000); // 30 segundos
+});
+
+// GET /api/bootstrap -> junta en UNA sola respuesta todo lo que la página
+// pide por separado al cargar (products, packs, evento, info, mensajes,
+// notification-banner, pay, ratings-summary). Cada pieza sigue usando su
+// propia caché en memoria (getOrSetCache), así que esto no duplica lecturas
+// a Firebase: solo evita que el frontend dispare 7-8 invocaciones de
+// función serverless en Vercel en vez de una. Los endpoints individuales
+// (/api/products, /api/packs, etc.) se mantienen intactos para el panel de
+// administración y para el polling de watchFirebasePath.
+app.get('/api/bootstrap', async (req, res) => {
+    try {
+        const [productMap, packMap, banner, mensajes, evento, info, pay, ratings] = await Promise.all([
+            getSecondaryProductMap(),
+            getPackMap(),
+            getOrSetCache('notification-banner', CACHE_TTL.NOTIFICATION, async () => {
+                const snapshot = await rtdb.ref(NOTIFICATION_BANNER_PATH).once('value');
+                return snapshot.val() || null;
+            }),
+            getOrSetCache('mensajes', CACHE_TTL.PUBLIC_DATA, async () => {
+                const snapshot = await rtdb.ref('mensajes').once('value');
+                const data = snapshot.val();
+                return Array.isArray(data) ? data : (data ? Object.values(data) : []);
+            }),
+            getOrSetCache('evento', CACHE_TTL.PUBLIC_DATA, async () => {
+                const snapshot = await rtdb.ref('evento').once('value');
+                return snapshot.val() || null;
+            }),
+            getOrSetCache('info', CACHE_TTL.PUBLIC_DATA, async () => {
+                const snapshot = await rtdb.ref('info').once('value');
+                const data = snapshot.val();
+                return Array.isArray(data) ? data : (data ? Object.values(data) : []);
+            }),
+            getOrSetCache('pay', CACHE_TTL.PUBLIC_DATA, async () => {
+                const snapshot = await rtdb.ref('pay').once('value');
+                return snapshot.val() || null;
+            }),
+            getRatingsSummaryCached()
+        ]);
+
+        setPublicCacheHeaders(res, 20, 60);
+        return res.json({
+            success: true,
+            products: Object.values(productMap || {}).map(product => addImageUrls(product, CLOUDINARY_PRODUCTS_FOLDER)),
+            packs: Object.values(packMap || {}).map(pack => addImageUrls(pack, CLOUDINARY_PACKS_FOLDER)),
+            banner: banner || null,
+            mensajes: mensajes || [],
+            evento: evento || null,
+            info: info || [],
+            pay: pay || null,
+            ratings: ratings || {}
+        });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener el bootstrap', error: error.message });
+    }
+});
+
+// =====================================================
+// 🔥 ENDPOINT PARA ENVIAR NOTIFICACIONES DE PRUEBA
+// =====================================================
+app.post("/api/send-test-notification", async (req, res) => {
+  try {
+    const { titulo, mensaje, tipoNotificacion } = req.body;
+
+    addLog(`Enviando notificación de prueba: ${titulo} - ${mensaje}`);
+
+    const message = {
+      notification: {
+        title: titulo || "🧪 Notificación de Prueba",
+        body: mensaje || "Esta es una notificación de prueba desde Casa Fresca."
+      },
+      data: {
+        tipo: tipoNotificacion || "test",
+        timestamp: new Date().toISOString(),
+        click_action: "FLUTTER_NOTIFICATION_CLICK"
+      },
+      topic: "pedidos" // Enviando al mismo topic que los pedidos reales
+    };
+
+    // Enviar la notificación
+    const responsePush = await admin.messaging().send(message);
+    
+    addLog(`✅ Notificación de prueba enviada correctamente: ${responsePush}`);
+    console.log("✅ Notificación de prueba enviada con éxito:", responsePush);
+
+    return res.status(200).json({
+      success: true,
+      message: "Notificación de prueba enviada correctamente",
+      messageId: responsePush
+    });
+
+  } catch (error) {
+    const errorMsg = `❌ Error enviando notificación de prueba: ${error.message}`;
+    addLog(errorMsg);
+    console.error(errorMsg);
+
+    return res.status(500).json({
+      success: false,
+      message: "Error al enviar la notificación de prueba",
+      error: error.message
+    });
+  }
+});
+
+// API para listar tokens FCM suscritos al topic pedidos
+app.get('/api/fcm-tokens', async (req, res) => {
+  try {
+    const tokens = secondaryRtdb
+      ? await readSecondaryNode('subscriptions/tokens', [])
+      : await readJsonFile(fcmTokensFilePath, []);
+    return res.json({ success: true, tokens });
+  } catch (error) {
+    const errorMsg = `ERROR al obtener tokens FCM: ${error.message}`;
+    addLog(errorMsg);
+    console.error(errorMsg);
+    return res.status(500).json({ success: false, message: 'Error al obtener tokens FCM', error: error.message });
+  }
+});
+
+app.post('/api/suscribir-pedidos', rateLimitMiddleware, async (req, res) => {
+  try {
+    const { token } = req.body;
+
+    if (!token || typeof token !== 'string' || token.trim() === '') {
+      return res.status(400).json({ success: false, message: 'El campo token es obligatorio' });
+    }
+
+    addLog(`Solicitud de suscripción recibida para token: ${token}`);
+
+    const sanitizedToken = token.trim();
+    await admin.messaging().subscribeToTopic(sanitizedToken, 'pedidos');
+
+    if (secondaryRtdb) {
+      const tokens = await readSecondaryNode('subscriptions/tokens', []);
+      const nextTokens = Array.isArray(tokens) ? tokens : [];
+      if (!nextTokens.includes(sanitizedToken)) {
+        nextTokens.push(sanitizedToken);
+        await writeSecondaryNode('subscriptions/tokens', nextTokens);
+        addLog(`Token almacenado en RTDB secundaria: ${sanitizedToken}`);
+      }
+      return res.json({ success: true, message: 'Token suscrito al topic pedidos', token: sanitizedToken });
+    }
+
+    const tokens = await readJsonFile(fcmTokensFilePath, []);
+    if (!tokens.includes(sanitizedToken)) {
+      tokens.push(sanitizedToken);
+      await writeJsonFile(fcmTokensFilePath, tokens);
+      addLog(`Token almacenado: ${sanitizedToken}`);
+    }
+
+    return res.json({ success: true, message: 'Token suscrito al topic pedidos', token: sanitizedToken });
+  } catch (error) {
+    const errorMsg = `ERROR suscribiendo token FCM al topic pedidos: ${error.message}`;
+    addLog(errorMsg);
+    console.error(errorMsg);
+    return res.status(500).json({ success: false, message: 'Error al suscribir al topic pedidos', error: error.message });
+  }
+});

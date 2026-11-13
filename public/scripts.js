@@ -1,77 +1,415 @@
-let serverStartTime;
+(function () {
+    const TOKEN_KEY = 'buquenque_auth_token';
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+        const opts = init ? Object.assign({}, init) : {};
+        const token = localStorage.getItem(TOKEN_KEY);
+        if (token) {
+            opts.headers = Object.assign({}, opts.headers, { Authorization: `Bearer ${token}` });
+        }
+        return originalFetch(input, opts);
+    };
+    window.buquenqueAuth = {
+        setToken(token) { localStorage.setItem(TOKEN_KEY, token); },
+        clearToken() { localStorage.removeItem(TOKEN_KEY); }
+    };
+})();
 
-// Variable para almacenar los pedidos nuevos
+let serverStartTime;
 let newOrders = [];
 
-// Function to update the server uptime display
-function updateUptime() {
-    if (!serverStartTime) return;
-    
-    const now = new Date();
-    const diffMs = now - serverStartTime;
+(async function ensureSession() {
+    try {
+        const res = await fetch('/api/auth/me');
+        const data = await res.json();
+        if (!data || !data.authenticated) {
+            window.location.href = '/login';
+            return;
+        }
+        document.documentElement.classList.add('auth-ready');
+    } catch (err) {
+        console.error('No se pudo verificar la sesión:', err);
+        document.documentElement.classList.add('auth-ready');
+    }
+})();
 
-    const seconds = Math.floor((diffMs / 1000) % 60);
-    const minutes = Math.floor((diffMs / (1000 * 60)) % 60);
-    const hours = Math.floor((diffMs / (1000 * 60 * 60)) % 24);
-    const days = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+const metricsHistory = { cpu: [], memory: [] };
+const METRICS_HISTORY_MAX = 40;
+let dashboardCycleCount = 0;
+const RENDER_METRICS_CYCLE_INTERVAL = 10;
+const RENDER_DEPLOYS_CYCLE_INTERVAL = 2;
+// Las visitas se piden cada 5 min: el backend ya las tiene cacheadas y solo
+// devuelve contadores, no el histórico completo.
+const STATS_REFRESH_MS = 5 * 60 * 1000;
 
-    document.getElementById('uptime').textContent =
-        `${days}d ${hours}h ${minutes}m ${seconds}s`;
+const EVENT_TYPE_LABELS = {
+    deploy_started: 'Despliegue iniciado',
+    deploy_ended: 'Despliegue finalizado',
+    build_started: 'Build iniciado',
+    build_ended: 'Build finalizado',
+    pre_deploy_started: 'Pre-deploy iniciado',
+    pre_deploy_ended: 'Pre-deploy finalizado',
+    server_available: 'Servidor disponible',
+    server_failed: 'Servidor con fallo',
+    server_hardware_failure: 'Fallo de hardware',
+    server_restarted: 'Servidor reiniciado',
+    service_resumed: 'Servicio reanudado',
+    service_suspended: 'Servicio suspendido',
+    plan_changed: 'Plan cambiado',
+    instance_count_changed: 'Cambio en número de instancias',
+    autoscaling_started: 'Autoscaling iniciado',
+    autoscaling_ended: 'Autoscaling finalizado',
+    zero_downtime_redeploy_started: 'Redeploy sin downtime iniciado',
+    zero_downtime_redeploy_ended: 'Redeploy sin downtime finalizado',
+    auto_deploy_disabled: 'Auto-deploy desactivado',
+    auto_deploy_enabled: 'Auto-deploy activado',
+    branch_deleted: 'Rama eliminada',
+    commit_ignored: 'Commit ignorado',
+    image_pull_failed: 'Fallo al descargar imagen',
+    maintenance_started: 'Mantenimiento iniciado',
+    maintenance_ended: 'Mantenimiento finalizado'
+};
+
+const EVENT_FAILURE_TYPES = new Set(['server_failed', 'server_hardware_failure', 'image_pull_failed']);
+const EVENT_PROGRESS_TYPES = new Set(['deploy_started', 'build_started', 'pre_deploy_started', 'autoscaling_started', 'zero_downtime_redeploy_started', 'maintenance_started']);
+
+const DEPLOY_STATUS_LABELS = {
+    live: 'En vivo',
+    build_failed: 'Build fallido',
+    update_failed: 'Fallo al actualizar',
+    canceled: 'Cancelado',
+    deactivated: 'Desactivado',
+    building: 'Construyendo',
+    updating: 'Actualizando',
+    created: 'Creado',
+    queued: 'En cola',
+    pre_deploy_in_progress: 'Pre-deploy en curso',
+    pre_deploy_failed: 'Pre-deploy fallido'
+};
+
+function initTabs() {
+    const tabBar = document.getElementById('tab-bar');
+    if (!tabBar) return;
+    tabBar.addEventListener('click', (e) => {
+        const btn = e.target.closest('.tab-btn');
+        if (!btn) return;
+        const targetId = btn.getAttribute('data-tab');
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b === btn));
+        document.querySelectorAll('.tab-panel').forEach(panel => panel.classList.toggle('active', panel.id === targetId));
+        if (targetId === 'tab-deploys') fetchRenderDeploys();
+        if (targetId === 'tab-events') fetchRenderEvents();
+        if (targetId === 'tab-network') fetchRenderMetrics();
+    });
 }
 
-// Function to fetch server status and update the dashboard
+function updateLastUpdatedLabel() {
+    const el = document.getElementById('last-updated');
+    if (!el) return;
+    const now = new Date();
+    const time = now.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    el.innerHTML = `<i class="fas fa-rotate"></i> Actualizado ${time}`;
+}
+
+function formatDuration(totalSeconds) {
+    const seconds = Math.max(0, Math.floor(totalSeconds || 0));
+    const days = Math.floor(seconds / 86400);
+    const hours = Math.floor((seconds % 86400) / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    if (days > 0) return `${days}d ${hours}h`;
+    if (hours > 0) return `${hours}h ${minutes}m`;
+    return `${minutes}m`;
+}
+
+function formatBytes(bytes) {
+    const value = Number(bytes) || 0;
+    if (value >= 1024 * 1024 * 1024) return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+    if (value >= 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+    if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`;
+    return `${value.toFixed(0)} B`;
+}
+
+function formatRelativeTime(isoString) {
+    if (!isoString) return '-';
+    const date = new Date(isoString);
+    if (Number.isNaN(date.getTime())) return '-';
+    const diffMs = Date.now() - date.getTime();
+    const diffMin = Math.floor(diffMs / 60000);
+    if (diffMin < 1) return 'hace segundos';
+    if (diffMin < 60) return `hace ${diffMin} min`;
+    const diffHr = Math.floor(diffMin / 60);
+    if (diffHr < 24) return `hace ${diffHr} h`;
+    const diffDays = Math.floor(diffHr / 24);
+    return `hace ${diffDays} d`;
+}
+
+function renderUptimeHistory(data) {
+    const percentEl = document.getElementById('month-uptime-percent');
+    const secondsEl = document.getElementById('month-uptime-seconds');
+    const calendarEl = document.getElementById('uptime-calendar');
+    if (!percentEl || !secondsEl || !calendarEl) return;
+
+    const monthUptime = data.monthUptime || {};
+    percentEl.textContent = typeof monthUptime.percent === 'number' ? monthUptime.percent.toFixed(1) : '-';
+    secondsEl.textContent = formatDuration(monthUptime.totalSeconds);
+
+    const history = Array.isArray(data.uptimeHistory) ? data.uptimeHistory : [];
+    calendarEl.innerHTML = '';
+    if (history.length === 0) {
+        calendarEl.innerHTML = '<p class="token-list-placeholder">Sin historial todavía.</p>';
+        return;
+    }
+    history.forEach(day => {
+        const cell = document.createElement('div');
+        cell.className = 'uptime-calendar-cell';
+        const ratio = Math.max(0, Math.min(1, (day.seconds || 0) / 86400));
+        let level = 0;
+        if (ratio > 0.75) level = 4;
+        else if (ratio > 0.5) level = 3;
+        else if (ratio > 0.25) level = 2;
+        else if (ratio > 0) level = 1;
+        cell.setAttribute('data-level', String(level));
+        cell.title = `${day.date}: ${formatDuration(day.seconds)} activo`;
+        calendarEl.appendChild(cell);
+    });
+}
+
+function updateResourceUI(data) {
+    const cpuPercent = data.cpu ? data.cpu.percent : 0;
+    const rssBytes = data.memory ? data.memory.rss : 0;
+    const rssMb = rssBytes / (1024 * 1024);
+    const totalMemBytes = data.system ? data.system.totalMemory : 0;
+    const memPercent = totalMemBytes > 0 ? (rssBytes / totalMemBytes) * 100 : 0;
+
+    const cpuBar = document.getElementById('cpu-bar-fill');
+    const cpuLabel = document.getElementById('cpu-percent-label');
+    if (cpuBar && cpuLabel) {
+        cpuBar.style.width = `${Math.min(100, cpuPercent).toFixed(1)}%`;
+        cpuLabel.textContent = `${cpuPercent.toFixed(1)}%`;
+    }
+
+    const memBar = document.getElementById('memory-bar-fill');
+    const memLabel = document.getElementById('memory-percent-label');
+    if (memBar && memLabel) {
+        memBar.style.width = `${Math.min(100, memPercent).toFixed(1)}%`;
+        memLabel.textContent = `${rssMb.toFixed(1)} MB`;
+    }
+
+    const nodeVersionEl = document.getElementById('node-version');
+    if (nodeVersionEl && data.nodeVersion) nodeVersionEl.textContent = data.nodeVersion;
+
+    const cpuCoresEl = document.getElementById('cpu-cores');
+    if (cpuCoresEl && data.cpu && data.cpu.cores) cpuCoresEl.textContent = data.cpu.cores;
+
+    metricsHistory.cpu.push(cpuPercent);
+    metricsHistory.memory.push(rssMb);
+    if (metricsHistory.cpu.length > METRICS_HISTORY_MAX) metricsHistory.cpu.shift();
+    if (metricsHistory.memory.length > METRICS_HISTORY_MAX) metricsHistory.memory.shift();
+
+    drawLineChart('metrics-chart', [
+        { values: metricsHistory.cpu, color: '#4f9cf9', minMax: 100 },
+        { values: metricsHistory.memory, color: '#3ecf8e', minMax: 1 }
+    ]);
+
+    renderUptimeHistory(data);
+}
+
+function drawLineChart(canvasId, seriesList) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const width = canvas.width;
+    const height = canvas.height;
+    ctx.clearRect(0, 0, width, height);
+
+    const padding = 24;
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+        const y = padding + ((height - padding * 2) / 4) * i;
+        ctx.beginPath();
+        ctx.moveTo(padding, y);
+        ctx.lineTo(width - padding, y);
+        ctx.stroke();
+    }
+
+    seriesList.forEach(({ values, color, minMax }) => {
+        if (!values || values.length < 2) return;
+        const max = Math.max(minMax || 1, ...values);
+        const pointCount = values.length;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        values.forEach((value, index) => {
+            const x = padding + ((width - padding * 2) / (Math.max(pointCount - 1, 1))) * index;
+            const y = height - padding - ((value / max) * (height - padding * 2));
+            if (index === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+    });
+}
+
+function drawBarChart(canvasId, labels, values, color) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const width = canvas.width;
+    const height = canvas.height;
+    ctx.clearRect(0, 0, width, height);
+
+    const padding = 24;
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+        const y = padding + ((height - padding * 2) / 4) * i;
+        ctx.beginPath();
+        ctx.moveTo(padding, y);
+        ctx.lineTo(width - padding, y);
+        ctx.stroke();
+    }
+
+    if (!values || values.length === 0) return;
+    const max = Math.max(1, ...values);
+    const slotWidth = (width - padding * 2) / values.length;
+    const barWidth = Math.max(2, slotWidth * 0.6);
+
+    values.forEach((value, index) => {
+        const barHeight = (value / max) * (height - padding * 2);
+        const x = padding + slotWidth * index + (slotWidth - barWidth) / 2;
+        const y = height - padding - barHeight;
+        ctx.fillStyle = color;
+        ctx.fillRect(x, y, barWidth, barHeight);
+    });
+}
+
+function drawStackedBarChart(canvasId, labels, seriesList) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const width = canvas.width;
+    const height = canvas.height;
+    ctx.clearRect(0, 0, width, height);
+
+    const padding = 24;
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+        const y = padding + ((height - padding * 2) / 4) * i;
+        ctx.beginPath();
+        ctx.moveTo(padding, y);
+        ctx.lineTo(width - padding, y);
+        ctx.stroke();
+    }
+
+    const pointCount = labels.length;
+    if (pointCount === 0) return;
+
+    const totals = new Array(pointCount).fill(0);
+    seriesList.forEach(series => {
+        series.values.forEach((value, index) => { totals[index] += Math.max(0, value || 0); });
+    });
+    const max = Math.max(1, ...totals);
+
+    const slotWidth = (width - padding * 2) / pointCount;
+    const barWidth = Math.max(2, slotWidth * 0.6);
+
+    for (let index = 0; index < pointCount; index++) {
+        let stackedHeight = 0;
+        const x = padding + slotWidth * index + (slotWidth - barWidth) / 2;
+        seriesList.forEach(series => {
+            const value = Math.max(0, series.values[index] || 0);
+            if (value <= 0) return;
+            const segmentHeight = (value / max) * (height - padding * 2);
+            const y = height - padding - stackedHeight - segmentHeight;
+            ctx.fillStyle = series.color;
+            ctx.fillRect(x, y, barWidth, segmentHeight);
+            stackedHeight += segmentHeight;
+        });
+    }
+}
+
+function aggregateSeriesByHour(points) {
+    const byHour = new Map();
+    (points || []).forEach(point => {
+        if (!point || !point.timestamp) return;
+        const date = new Date(point.timestamp);
+        if (Number.isNaN(date.getTime())) return;
+        date.setMinutes(0, 0, 0);
+        const key = date.getTime();
+        byHour.set(key, (byHour.get(key) || 0) + (Number(point.value) || 0));
+    });
+    return byHour;
+}
+
+function alignBandwidthSourceSeries(bandwidthSources) {
+    const sources = ['http', 'websocket', 'serviceInitiated', 'privateLink'];
+    const maps = sources.map(key => aggregateSeriesByHour(bandwidthSources[key]));
+    const allKeys = new Set();
+    maps.forEach(map => map.forEach((_, key) => allKeys.add(key)));
+    const sortedKeys = Array.from(allKeys).sort((a, b) => a - b);
+    const labels = sortedKeys.map(key => new Date(key).toLocaleTimeString('es-ES', { hour: '2-digit' }));
+    const colors = { http: '#4f9cf9', websocket: '#7c6cf6', serviceInitiated: '#3ecf8e', privateLink: '#f0b73a' };
+    const series = sources.map(key => ({
+        key,
+        color: colors[key],
+        values: sortedKeys.map(k => (maps[sources.indexOf(key)].get(k) || 0) / (1024 * 1024))
+    }));
+    return { labels, series };
+}
+
 async function fetchServerStatus() {
     try {
         const response = await fetch('/api/server-status');
         const data = await response.json();
-        
-        // Update server start time if not already set
-        if (!serverStartTime) {
-            serverStartTime = new Date(data.startTime);
-            document.getElementById('start-time').textContent = 
-                new Date(data.startTime).toLocaleString('es-ES', { 
-                    timeZone: 'America/Havana' 
-                });
+
+        if (!response.ok || !data || !Array.isArray(data.logs)) {
+            console.error('Respuesta inválida de /api/server-status:', data);
+            return;
         }
 
-        // Update logs
+        if (!serverStartTime) {
+            serverStartTime = new Date(data.startTime);
+            document.getElementById('start-time').textContent =
+                new Date(data.startTime).toLocaleString('es-ES', { timeZone: 'America/Havana' });
+        }
+
         const logOutput = document.getElementById('log-output');
-        logOutput.innerHTML = ''; // Clear previous logs
+        logOutput.innerHTML = '';
         data.logs.forEach(log => {
             const logEntry = document.createElement('div');
             logEntry.classList.add('log-entry');
             logEntry.textContent = log;
             logOutput.appendChild(logEntry);
         });
-        logOutput.scrollTop = logOutput.scrollHeight; // Auto-scroll to bottom
+        logOutput.scrollTop = logOutput.scrollHeight;
+
+        updateResourceUI(data);
     } catch (error) {
         console.error('Error fetching server status:', error);
     }
 }
 
-// Function to fetch and update statistics
 async function updateStatistics() {
     try {
-        const response = await fetch('/obtener-estadisticas');
-        const stats = await response.json();
+        // El backend mantiene el resumen incrementalmente; aquí solo llegan
+        // contadores y series pequeñas, nunca el histórico completo.
+        const response = await fetch('/api/stats/summary');
+        const resumen = await response.json();
 
-        document.getElementById('total-requests').textContent = stats.length;
-
-        if (stats.length > 0) {
-            const lastStat = stats[stats.length - 1];
-            document.getElementById('last-request').textContent =
-                `${lastStat.fecha_hora_entrada} desde ${lastStat.pais} (${lastStat.ip})`;
-
-            const uniqueIPs = new Set(stats.map(s => s.ip));
-            document.getElementById('unique-users').textContent = uniqueIPs.size;
-
-            const recurringUsers = stats.filter(s => s.tipo_usuario === 'Recurrente').length;
-            document.getElementById('recurring-users').textContent = recurringUsers;
-        } else {
-            document.getElementById('last-request').textContent = 'N/A';
-            document.getElementById('unique-users').textContent = '0';
-            document.getElementById('recurring-users').textContent = '0';
+        if (!response.ok || !resumen || resumen.success === false) {
+            throw new Error((resumen && (resumen.error || resumen.message)) || 'Respuesta inválida');
         }
+
+        document.getElementById('total-requests').textContent = String(resumen.total ?? 0);
+        document.getElementById('unique-users').textContent = String(resumen.uniqueIps ?? 0);
+        document.getElementById('recurring-users').textContent = String(resumen.recurrentes ?? 0);
+
+        const ultimo = resumen.last;
+        document.getElementById('last-request').textContent = ultimo
+            ? `${ultimo.fecha_hora_entrada || '—'} desde ${ultimo.pais || '—'} (${ultimo.ip || '—'})`
+            : 'N/A';
+
+        renderTrafficChart(resumen);
     } catch (error) {
         console.error('Error fetching statistics:', error);
         document.getElementById('total-requests').textContent = 'Error';
@@ -81,16 +419,28 @@ async function updateStatistics() {
     }
 }
 
-// Function to clear the console (client-side only)
+function renderTrafficChart(resumen) {
+    const totalLabel = document.getElementById('traffic-total-label');
+    const byDay = resumen && Array.isArray(resumen.byDay) ? resumen.byDay : [];
+    if (!byDay.length) return;
+
+    const labels = byDay.map(item => String(item.day));
+    const counts = byDay.map(item => Number(item.count) || 0);
+    drawBarChart('traffic-chart', labels, counts, '#7c6cf6');
+
+    if (totalLabel) {
+        totalLabel.textContent = String(resumen.monthTotal ?? counts.reduce((sum, value) => sum + value, 0));
+    }
+}
+
 function clearConsole() {
     document.getElementById('log-output').innerHTML = '';
 }
 
-// Function to copy logs to clipboard
 function copyLogsToClipboard() {
     const logOutput = document.getElementById('log-output');
     const logsText = logOutput.innerText;
-    
+
     navigator.clipboard.writeText(logsText)
         .then(() => alert('Logs copiados al portapapeles!'))
         .catch(err => {
@@ -99,7 +449,6 @@ function copyLogsToClipboard() {
         });
 }
 
-// Function to clear statistics with better error handling
 async function clearStatistics() {
     if (!confirm('¿Estás seguro de que deseas eliminar todas las estadísticas?\nEsta acción no se puede deshacer.')) {
         return;
@@ -108,17 +457,13 @@ async function clearStatistics() {
     try {
         const response = await fetch('/api/clear-statistics', {
             method: 'POST',
-            headers: {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json'
-            }
+            headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' }
         });
 
         const data = await response.json();
 
         if (response.ok && data.success) {
             alert('Estadísticas limpiadas correctamente');
-            // Actualizar la vista
             await updateStatistics();
             await fetchServerStatus();
         } else {
@@ -130,221 +475,438 @@ async function clearStatistics() {
     }
 }
 
-// Función para obtener datos remotos desde GitHub
-async function fetchRemoteData() {
-    const remoteUrl = "https://raw.githubusercontent.com/HCoreBeat/Analytics-Montaque/main/data/estadistica.json";
-
+async function fetchRenderService() {
     try {
-        const response = await fetch(remoteUrl);
-        if (!response.ok) {
-            throw new Error(`Error al obtener datos remotos: ${response.statusText}`);
+        const response = await fetch('/api/render/service');
+        const data = await response.json();
+        const repoLine = document.getElementById('service-repo-line');
+        const statusPill = document.getElementById('service-status-pill');
+        const dashboardLink = document.getElementById('render-dashboard-link');
+
+        if (!response.ok || !data.success || !data.available) {
+            if (repoLine) repoLine.textContent = 'La API de Render no está configurada o no respondió.';
+            if (statusPill) { statusPill.textContent = 'Sin datos'; statusPill.className = 'status-pill status-pill-unknown'; }
+            return;
         }
-        const remoteData = await response.json();
-        return remoteData;
-    } catch (error) {
-        console.error("Error al obtener datos remotos:", error);
-        alert("No se pudieron obtener los datos remotos. Verifica tu conexión a internet.");
-        return [];
-    }
-}
 
-// Función para comparar datos locales con remotos y filtrar pedidos nuevos
-async function findNewOrders() {
-    try {
-        // Obtener datos locales
-        const response = await fetch('/obtener-estadisticas');
-        const localData = await response.json();
-
-        // Obtener datos remotos
-        const remoteData = await fetchRemoteData();
-
-        // Filtrar pedidos nuevos
-        newOrders = localData.filter(localItem => {
-            // Verificar que el registro local tiene compras
-            const isOrder = Array.isArray(localItem.compras) && localItem.compras.length > 0;
-
-            if (!isOrder) {
-                return false; // No es un pedido, ignorar
+        if (repoLine) repoLine.textContent = `${data.repo || 'repositorio desconocido'} · ${data.type || ''}`.trim();
+        if (statusPill) {
+            if (data.suspended && data.suspended !== 'not_suspended') {
+                statusPill.textContent = 'Suspendido';
+                statusPill.className = 'status-pill status-pill-suspended';
+            } else {
+                statusPill.textContent = 'Activo';
+                statusPill.className = 'status-pill status-pill-ok';
             }
-
-            // Verificar si el pedido ya existe en los datos remotos
-            return !remoteData.some(remoteItem => {
-                return (
-                    Array.isArray(remoteItem.compras) && remoteItem.compras.length > 0 &&
-                    remoteItem.ip === localItem.ip &&
-                    remoteItem.fecha_hora_entrada === localItem.fecha_hora_entrada
-                );
-            });
-        });
-
-        console.log("Pedidos nuevos:", newOrders);
-        updateNewOrdersCount();
-
+        }
+        document.getElementById('service-plan').textContent = data.plan || '-';
+        document.getElementById('service-region').textContent = data.region || '-';
+        document.getElementById('service-branch').textContent = data.branch || '-';
+        document.getElementById('service-autodeploy').textContent = data.autoDeploy === false ? 'Desactivado' : 'Activado';
+        if (dashboardLink && data.dashboardUrl) dashboardLink.href = data.dashboardUrl;
     } catch (error) {
-        console.error("Error al comparar datos locales y remotos:", error);
-        alert("Ocurrió un error al comparar los datos locales y remotos.");
+        console.error('Error obteniendo el servicio de Render:', error);
     }
 }
 
-// Function to show the number of new orders
-function updateNewOrdersCount() {
-    const countElement = document.getElementById('new-orders-count');
-    countElement.textContent = newOrders.length;
-    const button = document.getElementById('new-orders-button');
-    button.style.display = newOrders.length > 0 ? 'block' : 'none';
+function buildDeployItem(deploy) {
+    const item = document.createElement('div');
+    item.className = 'deploy-item';
+
+    const dot = document.createElement('div');
+    dot.className = `deploy-status-dot status-${deploy.status || 'unknown'}`;
+    item.appendChild(dot);
+
+    const main = document.createElement('div');
+    main.className = 'deploy-main';
+
+    const title = document.createElement('div');
+    title.className = 'deploy-title';
+    const statusLabel = DEPLOY_STATUS_LABELS[deploy.status] || deploy.status || 'Desconocido';
+    title.innerHTML = `<span>${statusLabel}</span>`;
+    if (deploy.commit && deploy.commit.shortId) {
+        const badge = document.createElement('span');
+        badge.className = 'commit-badge';
+        badge.textContent = deploy.commit.shortId;
+        title.appendChild(badge);
+    }
+    main.appendChild(title);
+
+    if (deploy.commit && deploy.commit.message) {
+        const commitMsg = document.createElement('div');
+        commitMsg.className = 'deploy-commit-msg';
+        commitMsg.textContent = deploy.commit.message;
+        main.appendChild(commitMsg);
+    }
+
+    const meta = document.createElement('div');
+    meta.className = 'deploy-meta';
+    const created = document.createElement('span');
+    created.innerHTML = `<i class="fas fa-clock"></i> ${formatRelativeTime(deploy.createdAt)}`;
+    meta.appendChild(created);
+    if (deploy.trigger) {
+        const trigger = document.createElement('span');
+        trigger.innerHTML = `<i class="fas fa-bolt"></i> ${deploy.trigger}`;
+        meta.appendChild(trigger);
+    }
+    main.appendChild(meta);
+
+    item.appendChild(main);
+    return item;
 }
 
-// Función para mostrar los pedidos nuevos en el panel
-function showNewOrdersPanel() {
-    const panel = document.getElementById('new-orders-panel');
-    const ordersList = document.getElementById('orders-list');
+async function fetchRenderDeploys() {
+    const container = document.getElementById('deploys-list');
+    if (!container) return;
+    try {
+        const response = await fetch('/api/render/deploys');
+        const data = await response.json();
 
-    // Limpiar contenido previo
-    ordersList.textContent = '';
+        if (!response.ok || !data.success || !data.available) {
+            container.innerHTML = '<p class="token-list-placeholder">No se pudieron cargar los despliegues. Verifica RENDER_API_KEY y RENDER_SERVICE_ID.</p>';
+            return;
+        }
 
-    // Agregar cada pedido en formato JSON con un botón para copiar
-    newOrders.forEach((order, index) => {
-        const orderContainer = document.createElement('div');
-        orderContainer.style.marginBottom = '15px';
-        orderContainer.style.padding = '15px';
-        orderContainer.style.border = '1px solid #ddd';
-        orderContainer.style.borderRadius = '5px';
-        orderContainer.style.background = '#fff';
-        orderContainer.style.overflow = 'auto';
-        orderContainer.style.maxHeight = '200px';
+        const deploys = Array.isArray(data.deploys) ? data.deploys : [];
+        if (deploys.length === 0) {
+            container.innerHTML = '<p class="token-list-placeholder">Sin despliegues registrados.</p>';
+            return;
+        }
 
-        const orderJson = JSON.stringify(order, null, 2);
+        container.innerHTML = '';
+        deploys.forEach(deploy => container.appendChild(buildDeployItem(deploy)));
+    } catch (error) {
+        console.error('Error obteniendo despliegues de Render:', error);
+        container.innerHTML = '<p class="token-list-error">Error cargando despliegues.</p>';
+    }
+}
 
-        const orderText = document.createElement('pre');
-        orderText.textContent = orderJson;
-        orderText.style.whiteSpace = 'pre-wrap';
-        orderText.style.wordBreak = 'break-word';
-        orderText.style.margin = '0';
-        orderText.style.fontSize = '14px';
-        orderText.style.lineHeight = '1.5';
-        orderText.style.color = '#333';
-        orderText.style.background = '#f4f4f4';
-        orderText.style.padding = '10px';
-        orderText.style.borderRadius = '5px';
+function buildEventItem(event) {
+    const item = document.createElement('div');
+    item.className = 'event-item';
 
-        const copyButton = document.createElement('button');
-        copyButton.textContent = 'Copiar JSON';
-        copyButton.style.marginTop = '10px';
-        copyButton.style.background = '#007bff';
-        copyButton.style.color = 'white';
-        copyButton.style.border = 'none';
-        copyButton.style.borderRadius = '5px';
-        copyButton.style.padding = '5px 10px';
-        copyButton.style.cursor = 'pointer';
+    const dot = document.createElement('div');
+    let statusClass = 'status-ok';
+    if (EVENT_FAILURE_TYPES.has(event.type)) statusClass = 'status-failed';
+    else if (EVENT_PROGRESS_TYPES.has(event.type)) statusClass = 'status-progress';
+    dot.className = `event-status-dot ${statusClass}`;
+    item.appendChild(dot);
 
-        copyButton.addEventListener('click', () => {
-            navigator.clipboard.writeText(orderJson).then(() => {
-                alert(`Pedido ${index + 1} copiado al portapapeles.`);
-            }).catch(err => {
-                console.error('Error al copiar el JSON:', err);
-                alert('Error al copiar el JSON. Por favor, intenta de nuevo.');
+    const main = document.createElement('div');
+    main.className = 'event-main';
+
+    const title = document.createElement('div');
+    title.className = 'event-title';
+    title.textContent = EVENT_TYPE_LABELS[event.type] || event.type || 'Evento';
+    main.appendChild(title);
+
+    const meta = document.createElement('div');
+    meta.className = 'event-meta';
+    const time = document.createElement('span');
+    time.innerHTML = `<i class="fas fa-clock"></i> ${formatRelativeTime(event.timestamp)}`;
+    meta.appendChild(time);
+    main.appendChild(meta);
+
+    item.appendChild(main);
+    return item;
+}
+
+async function fetchRenderEvents() {
+    const container = document.getElementById('events-list');
+    if (!container) return;
+    try {
+        const response = await fetch('/api/render/events');
+        const data = await response.json();
+
+        if (!response.ok || !data.success || !data.available) {
+            container.innerHTML = '<p class="token-list-placeholder">No se pudieron cargar los eventos. Verifica RENDER_API_KEY y RENDER_SERVICE_ID.</p>';
+            return;
+        }
+
+        const events = Array.isArray(data.events) ? data.events : [];
+        if (events.length === 0) {
+            container.innerHTML = '<p class="token-list-placeholder">Sin eventos recientes.</p>';
+            return;
+        }
+
+        container.innerHTML = '';
+        events.forEach(event => container.appendChild(buildEventItem(event)));
+    } catch (error) {
+        console.error('Error obteniendo eventos de Render:', error);
+        container.innerHTML = '<p class="token-list-error">Error cargando eventos.</p>';
+    }
+}
+
+async function fetchRenderMetrics() {
+    const section = document.getElementById('render-metrics-section');
+    if (!section) return;
+
+    try {
+        const response = await fetch('/api/render-metrics');
+        const data = await response.json();
+
+        if (!response.ok || !data.success || !data.available) {
+            section.classList.add('hidden');
+            const bwEmpty = document.getElementById('bandwidth-sources-empty');
+            const httpEmpty = document.getElementById('http-requests-empty');
+            if (bwEmpty) bwEmpty.style.display = 'block';
+            if (httpEmpty) httpEmpty.style.display = 'block';
+            return;
+        }
+
+        section.classList.remove('hidden');
+
+        const cpuSeries = (data.cpu || []).map(point => point.value);
+        const memorySeries = (data.memory || []).map(point => point.value / (1024 * 1024));
+        const bandwidthSeries = data.bandwidth || [];
+
+        const cpuAvg = cpuSeries.length ? cpuSeries.reduce((a, b) => a + b, 0) / cpuSeries.length : 0;
+        const memoryAvg = memorySeries.length ? memorySeries.reduce((a, b) => a + b, 0) / memorySeries.length : 0;
+        const bandwidthTotalMb = bandwidthSeries.length >= 2
+            ? Math.max(0, (bandwidthSeries[bandwidthSeries.length - 1].value - bandwidthSeries[0].value) / (1024 * 1024))
+            : 0;
+
+        document.getElementById('render-cpu-value').textContent = `${cpuAvg.toFixed(2)}%`;
+        document.getElementById('render-memory-value').textContent = `${memoryAvg.toFixed(1)} MB`;
+        document.getElementById('render-bandwidth-value').textContent = `${bandwidthTotalMb.toFixed(1)} MB`;
+
+        const updatedLabel = document.getElementById('render-metrics-updated');
+        if (updatedLabel && data.updatedAt) {
+            updatedLabel.textContent = `Actualizado ${new Date(data.updatedAt).toLocaleTimeString('es-ES')}`;
+        }
+
+        drawLineChart('render-metrics-chart', [
+            { values: cpuSeries, color: '#4f9cf9', minMax: 100 },
+            { values: memorySeries, color: '#3ecf8e', minMax: 1 }
+        ]);
+
+        const bwEmpty = document.getElementById('bandwidth-sources-empty');
+        const bandwidthSources = data.bandwidthSources || {};
+        const hasBandwidthSources = ['http', 'websocket', 'serviceInitiated', 'privateLink']
+            .some(key => Array.isArray(bandwidthSources[key]) && bandwidthSources[key].length > 0);
+
+        if (hasBandwidthSources) {
+            if (bwEmpty) bwEmpty.style.display = 'none';
+            const aligned = alignBandwidthSourceSeries(bandwidthSources);
+            drawStackedBarChart('bandwidth-sources-chart', aligned.labels, aligned.series);
+        } else if (bwEmpty) {
+            bwEmpty.style.display = 'block';
+        }
+
+        const httpEmpty = document.getElementById('http-requests-empty');
+        const httpRequests = Array.isArray(data.httpRequests) ? data.httpRequests : [];
+        if (httpRequests.length > 0) {
+            if (httpEmpty) httpEmpty.style.display = 'none';
+            const totalsByLabel = new Map();
+            httpRequests.forEach(point => {
+                const key = point.label || 'total';
+                totalsByLabel.set(key, (totalsByLabel.get(key) || 0) + (Number(point.value) || 0));
             });
-        });
-
-        orderContainer.appendChild(orderText);
-        orderContainer.appendChild(copyButton);
-        ordersList.appendChild(orderContainer);
-    });
-
-    panel.style.display = 'block';
+            const labels = Array.from(totalsByLabel.keys());
+            const values = Array.from(totalsByLabel.values());
+            drawBarChart('http-requests-chart', labels, values, '#4f9cf9');
+        } else if (httpEmpty) {
+            httpEmpty.style.display = 'block';
+        }
+    } catch (error) {
+        section.classList.add('hidden');
+        console.error('Error obteniendo métricas de Render:', error);
+    }
 }
 
-// Función para cerrar el panel
-function closeNewOrdersPanel() {
-    const panel = document.getElementById('new-orders-panel');
-    panel.style.display = 'none';
+function updateUptime() {
+    if (!serverStartTime) return;
+
+    const now = new Date();
+    const diffMs = now - serverStartTime;
+
+    const seconds = Math.floor((diffMs / 1000) % 60);
+    const minutes = Math.floor((diffMs / (1000 * 60)) % 60);
+    const hours = Math.floor((diffMs / (1000 * 60 * 60)) % 24);
+    const days = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+
+    document.getElementById('uptime').textContent = `${days}d ${hours}h ${minutes}m ${seconds}s`;
 }
 
-// Initialize dashboard
 function initDashboard() {
-    // Update uptime every second
+    initTabs();
+
     setInterval(updateUptime, 1000);
 
-    // Update server status and statistics every 3 seconds
+    // Sondeo general cada 60 s (antes 30 s). Si la pestaña está en segundo
+    // plano no se pide nada: un dashboard olvidado abierto ya no consume
+    // ancho de banda ni lecturas de Firebase.
     setInterval(() => {
+        if (document.hidden) return;
+        dashboardCycleCount += 1;
+        fetchServerStatus();
+        updateLastUpdatedLabel();
+        if (dashboardCycleCount % RENDER_METRICS_CYCLE_INTERVAL === 0) {
+            fetchRenderMetrics();
+        }
+        if (dashboardCycleCount % RENDER_DEPLOYS_CYCLE_INTERVAL === 0) {
+            const activeTab = document.querySelector('.tab-panel.active');
+            if (activeTab && activeTab.id === 'tab-deploys') fetchRenderDeploys();
+            if (activeTab && activeTab.id === 'tab-events') fetchRenderEvents();
+        }
+    }, 60000);
+
+    // Estadísticas de visitas: cada 5 min y también solo con la pestaña visible.
+    setInterval(() => {
+        if (!document.hidden) updateStatistics();
+    }, STATS_REFRESH_MS);
+
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) return;
         fetchServerStatus();
         updateStatistics();
-    }, 30000);
+        updateLastUpdatedLabel();
+    });
 
-    // Initial update
     fetchServerStatus();
     updateStatistics();
+    updateLastUpdatedLabel();
+    fetchRenderService();
+    fetchRenderMetrics();
 }
 
-// Start dashboard when page loads
 window.addEventListener('load', initDashboard);
 
-// Asegurar que los eventos se agreguen después de que el DOM esté completamente cargado
 document.addEventListener('DOMContentLoaded', () => {
-    const newOrdersButton = document.getElementById('new-orders-button');
-    const closeOrdersPanel = document.getElementById('close-orders-panel');
-
-    if (newOrdersButton) {
-        newOrdersButton.addEventListener('click', showNewOrdersPanel);
-    } else {
-        console.error('Elemento con ID "new-orders-button" no encontrado.');
+    const logoutButton = document.getElementById('logout-button');
+    if (logoutButton) {
+        logoutButton.addEventListener('click', async () => {
+            if (!confirm('¿Cerrar sesión?')) return;
+            try {
+                await fetch('/api/auth/logout', { method: 'POST' });
+            } finally {
+                window.buquenqueAuth.clearToken();
+                window.location.href = '/login';
+            }
+        });
     }
 
-    if (closeOrdersPanel) {
-        closeOrdersPanel.addEventListener('click', closeNewOrdersPanel);
-    } else {
-        console.error('Elemento con ID "close-orders-panel" no encontrado.');
+    const changePasswordButton = document.getElementById('change-password-button');
+    if (changePasswordButton) {
+        changePasswordButton.addEventListener('click', async () => {
+            const currentPassword = prompt('Contraseña actual:');
+            if (!currentPassword) return;
+
+            const newUsername = prompt('Nuevo usuario (deja vacío para no cambiarlo):') || undefined;
+
+            const newPassword = prompt('Nueva contraseña (mínimo 8 caracteres):');
+            if (!newPassword) return;
+
+            const confirmPassword = prompt('Confirma la nueva contraseña:');
+            if (newPassword !== confirmPassword) {
+                alert('Las contraseñas no coinciden.');
+                return;
+            }
+
+            try {
+                const res = await fetch('/api/auth/change-password', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ currentPassword, newPassword, newUsername })
+                });
+                const data = await res.json();
+                if (res.ok && data.success) {
+                    alert('Credenciales actualizadas. Vuelve a iniciar sesión.');
+                    window.location.href = '/login';
+                } else {
+                    alert(data.message || 'No se pudo cambiar la contraseña.');
+                }
+            } catch (err) {
+                alert('Error de conexión al cambiar la contraseña.');
+            }
+        });
     }
 
-    // Asociar el botón de actualización con la función updateData
-    const updateButton = document.getElementById('update-comparison-button');
-    if (updateButton) {
-        updateButton.addEventListener('click', updateData);
+    const fcmSubscribeButton = document.getElementById('fcm-subscribe-button');
+    if (fcmSubscribeButton) {
+        fcmSubscribeButton.addEventListener('click', subscribeFcmToken);
+    }
+
+    const fcmRefreshButton = document.getElementById('fcm-refresh-button');
+    if (fcmRefreshButton) {
+        fcmRefreshButton.addEventListener('click', loadFcmTokens);
+    }
+
+    loadFcmTokens();
+});
+
+function openTestNotificationModal() {
+    const modal = document.getElementById('test-notification-modal');
+    modal.classList.add('show');
+    modal.style.display = 'flex';
+}
+
+function closeTestNotificationModal() {
+    const modal = document.getElementById('test-notification-modal');
+    modal.classList.remove('show');
+    modal.style.display = 'none';
+}
+
+async function sendTestNotification() {
+    const titulo = document.getElementById('notif-titulo').value.trim();
+    const mensaje = document.getElementById('notif-mensaje').value.trim();
+    const tipoNotificacion = document.getElementById('notif-tipo').value.trim();
+
+    if (!titulo || !mensaje) {
+        showNotificationPanel('Por favor, completa todos los campos.', 'error');
+        return;
+    }
+
+    try {
+        const response = await fetch('/api/send-test-notification', {
+            method: 'POST',
+            headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+            body: JSON.stringify({ titulo, mensaje, tipoNotificacion })
+        });
+
+        const data = await response.json();
+
+        if (response.ok && data.success) {
+            showNotificationPanel(`✅ Notificación enviada correctamente!\nID: ${data.messageId}`, 'success');
+            closeTestNotificationModal();
+            document.getElementById('notif-titulo').value = '🧪 Notificación de Prueba';
+            document.getElementById('notif-mensaje').value = 'Esta es una notificación de prueba desde el servidor Casa Fresca.';
+            document.getElementById('notif-tipo').value = 'test';
+        } else {
+            throw new Error(data.message || 'Error desconocido al enviar la notificación');
+        }
+    } catch (error) {
+        console.error('❌ Error al enviar notificación de prueba:', error);
+        showNotificationPanel(`❌ Error: ${error.message}`, 'error');
+    }
+}
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+        const modal = document.getElementById('test-notification-modal');
+        if (modal && modal.style.display === 'flex') {
+            closeTestNotificationModal();
+        }
     }
 });
 
-// Call the function to find new orders when the page loads
-window.onload = () => {
-    findNewOrders();
-};
-
-// Verificar nuevos pedidos al cargar la página
-window.addEventListener('DOMContentLoaded', async () => {
-    try {
-        // Hacer una solicitud a la API para actualizar la comparación
-        const response = await fetch('/api/update-comparison', { method: 'POST' });
-        const data = await response.json();
-
-        if (data.success && data.newOrders.length > 0) {
-            console.log(`Se encontraron ${data.newOrders.length} nuevos pedidos.`);
-
-            // Mostrar el botón new-orders-button
-            const newOrdersButton = document.getElementById('new-orders-button');
-            if (newOrdersButton) {
-                newOrdersButton.style.display = 'block';
-            }
-        } else {
-            console.log('No se encontraron nuevos pedidos.');
-        }
-    } catch (error) {
-        console.error('Error al verificar nuevos pedidos:', error);
+document.addEventListener('click', (e) => {
+    const modal = document.getElementById('test-notification-modal');
+    if (modal && e.target === modal) {
+        closeTestNotificationModal();
     }
 });
 
 function clearOrdersPanel() {
     const panel = document.getElementById('new-orders-panel');
     const ordersList = document.getElementById('orders-list');
-
-    // Limpiar contenido del panel
+    if (!panel || !ordersList) return;
     ordersList.textContent = '';
-
-    // Ocultar el panel si está activo
     if (panel.classList.contains('active')) {
         panel.classList.remove('active');
     }
 }
 
-// Mostrar notificación en la parte superior de la pantalla
 function showNotification(message, type = 'info') {
     const notificationPanel = document.getElementById('notification-panel');
     if (!notificationPanel) {
@@ -357,9 +919,7 @@ function showNotification(message, type = 'info') {
     notification.className = `notification ${type}`;
     notificationPanel.appendChild(notification);
 
-    setTimeout(() => {
-        notification.remove();
-    }, 10000); // Mantener duración de 10 segundos
+    setTimeout(() => { notification.remove(); }, 10000);
 }
 
 function showNotificationPanel(message, type = 'info') {
@@ -369,170 +929,96 @@ function showNotificationPanel(message, type = 'info') {
     notificationMessage.className = `notification ${type}`;
     notificationPanel.appendChild(notificationMessage);
 
-    setTimeout(() => {
-        notificationMessage.remove();
-    }, 5000);
+    setTimeout(() => { notificationMessage.remove(); }, 5000);
 }
 
-// Llamar a esta función después de limpiar estadísticas
-async function handleClearStatistics() {
+async function loadFcmTokens() {
     try {
-        const response = await fetch('/api/clear-statistics', { method: 'POST' });
-        const result = await response.json();
-
-        if (result.success) {
-            showNotificationPanel('Estadísticas limpiadas correctamente.', 'success');
-
-            // Vaciar la lista de pedidos nuevos
-            newOrders = [];
-
-            // Limpiar el contenido del panel de pedidos
-            const ordersList = document.getElementById('orders-list');
-            ordersList.textContent = '';
-
-            // Ocultar el botón de pedidos
-            const newOrdersButton = document.getElementById('new-orders-button');
-            newOrdersButton.classList.add('hidden');
-
-            // Ocultar el panel si está activo
-            const panel = document.getElementById('new-orders-panel');
-            if (panel.classList.contains('active')) {
-                panel.classList.remove('active');
-            }
-
-            // Mostrar notificación de comparación
-            if (result.newOrders.length > 0) {
-                showNotificationPanel(`Se encontraron ${result.newOrders.length} nuevos pedidos.`, 'info');
-            } else {
-                showNotificationPanel('No hay nuevos pedidos.', 'info');
-            }
-        } else {
-            throw new Error(result.error || 'Error desconocido al limpiar estadísticas.');
-        }
-    } catch (error) {
-        console.error('Error al limpiar estadísticas:', error);
-        showNotificationPanel('Error al limpiar estadísticas. Por favor, intenta de nuevo.', 'error');
-    }
-}
-
-async function handleUpdateComparison() {
-    try {
-        const response = await fetch('/api/update-comparison', { method: 'POST' });
-        const result = await response.json();
-
-        if (result.success) {
-            newOrders = result.newOrders;
-            updateNewOrdersCount();
-
-            if (newOrders.length > 0) {
-                showNotificationPanel(`Se encontraron ${newOrders.length} nuevos pedidos.`, 'info');
-            } else {
-                showNotificationPanel('No hay nuevos pedidos.', 'info');
-            }
-        } else {
-            throw new Error(result.error || 'Error desconocido al actualizar comparación.');
-        }
-    } catch (error) {
-        console.error('Error al actualizar comparación:', error);
-        showNotificationPanel('Error al actualizar comparación. Por favor, intenta de nuevo.', 'error');
-    }
-}
-
-// Mostrar notificación al actualizar
-async function updateData() {
-    showNotification('Actualizando datos...', 'info');
-
-    try {
-        const response = await fetch('/api/update-comparison', { method: 'POST' }); // Cambiado a POST
+        const response = await fetch('/api/fcm-tokens');
         const data = await response.json();
 
-        if (data.success) {
-            showNotification('Datos actualizados correctamente.', 'success');
-        } else {
-            showNotification('Error al actualizar los datos.', 'error');
+        const listContainer = document.getElementById('fcm-token-list');
+        if (!listContainer) return;
+
+        if (!response.ok || !data.success) {
+            const errP = document.createElement('p');
+            errP.className = 'token-list-error';
+            errP.textContent = `Error cargando tokens: ${data.message || 'Respuesta inválida'}`;
+            listContainer.innerHTML = '';
+            listContainer.appendChild(errP);
+            return;
         }
+
+        const tokens = Array.isArray(data.tokens) ? data.tokens : [];
+        const countBadge = document.getElementById('fcm-token-count');
+        if (countBadge) countBadge.textContent = String(tokens.length);
+
+        if (tokens.length === 0) {
+            listContainer.innerHTML = '<p class="token-list-placeholder">No hay tokens cargados aún. Presiona "Cargar tokens".</p>';
+            return;
+        }
+
+        listContainer.innerHTML = '';
+        tokens.forEach((token, index) => {
+            const tokenItem = document.createElement('div');
+            tokenItem.className = 'token-item';
+
+            const tokenIndex = document.createElement('div');
+            tokenIndex.className = 'token-index';
+            tokenIndex.textContent = `${index + 1}`;
+
+            const tokenValue = document.createElement('div');
+            tokenValue.className = 'token-value';
+            tokenValue.textContent = token;
+
+            tokenItem.appendChild(tokenIndex);
+            tokenItem.appendChild(tokenValue);
+            listContainer.appendChild(tokenItem);
+        });
     } catch (error) {
-        showNotification('Error de conexión al actualizar.', 'error');
+        const listContainer = document.getElementById('fcm-token-list');
+        if (listContainer) {
+            const errP = document.createElement('p');
+            errP.className = 'token-list-error';
+            errP.textContent = `Error cargando tokens: ${error.message}`;
+            listContainer.innerHTML = '';
+            listContainer.appendChild(errP);
+        }
+        console.error('Error cargando tokens FCM:', error);
     }
 }
 
-// Unificar manejo de visibilidad del botón de pedidos
-function updateNewOrdersButtonVisibility() {
-    const button = document.getElementById('new-orders-button');
-    if (newOrders.length > 0) {
-        button.style.display = 'block';
-    } else {
-        button.style.display = 'none';
-    }
-}
-
-// Llamar esta función después de actualizar pedidos
-updateNewOrdersButtonVisibility();
-
-// --- POLLING AUTOMÁTICO DE NUEVOS PEDIDOS ---
-setInterval(async () => {
+async function subscribeFcmToken() {
     try {
-        const response = await fetch('/api/update-comparison', { method: 'POST' });
+        const input = document.getElementById('fcm-token-input');
+        if (!input) return;
+
+        const token = input.value.trim();
+        if (!token) {
+            showNotificationPanel('Ingresa un token FCM válido antes de suscribir.', 'error');
+            return;
+        }
+
+        const response = await fetch('/api/suscribir-pedidos', {
+            method: 'POST',
+            headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token })
+        });
+
         const data = await response.json();
-        if (data.success) {
-            // Actualizar variable global y contador
-            newOrders = data.newOrders;
-            updateNewOrdersCount();
-            // Actualizar lista de pedidos en el panel si está abierto
-            const panel = document.getElementById('new-orders-panel');
-            if (panel && panel.style.display === 'block') {
-                const ordersList = document.getElementById('orders-list');
-                ordersList.textContent = '';
-                newOrders.forEach((order, index) => {
-                    const orderContainer = document.createElement('div');
-                    orderContainer.style.marginBottom = '15px';
-                    orderContainer.style.padding = '15px';
-                    orderContainer.style.border = '1px solid #ddd';
-                    orderContainer.style.borderRadius = '5px';
-                    orderContainer.style.background = '#fff';
-                    orderContainer.style.overflow = 'auto';
-                    orderContainer.style.maxHeight = '200px';
-                    const orderJson = JSON.stringify(order, null, 2);
-                    const orderText = document.createElement('pre');
-                    orderText.textContent = orderJson;
-                    orderText.style.whiteSpace = 'pre-wrap';
-                    orderText.style.wordBreak = 'break-word';
-                    orderText.style.margin = '0';
-                    orderText.style.fontSize = '14px';
-                    orderText.style.lineHeight = '1.5';
-                    orderText.style.color = '#333';
-                    orderText.style.background = '#f4f4f4';
-                    orderText.style.padding = '10px';
-                    orderText.style.borderRadius = '5px';
-                    const copyButton = document.createElement('button');
-                    copyButton.textContent = 'Copiar JSON';
-                    copyButton.style.marginTop = '10px';
-                    copyButton.style.background = '#007bff';
-                    copyButton.style.color = 'white';
-                    copyButton.style.border = 'none';
-                    copyButton.style.borderRadius = '5px';
-                    copyButton.style.padding = '5px 10px';
-                    copyButton.style.cursor = 'pointer';
-                    copyButton.addEventListener('click', () => {
-                        navigator.clipboard.writeText(orderJson).then(() => {
-                            alert(`Pedido ${index + 1} copiado al portapapeles.`);
-                        }).catch(err => {
-                            console.error('Error al copiar el JSON:', err);
-                            alert('Error al copiar el JSON. Por favor, intenta de nuevo.');
-                        });
-                    });
-                    orderContainer.appendChild(orderText);
-                    orderContainer.appendChild(copyButton);
-                    ordersList.appendChild(orderContainer);
-                });
-            }
+        if (response.ok && data.success) {
+            showNotificationPanel('Token suscrito correctamente al topic pedidos.', 'success');
+            input.value = '';
+            loadFcmTokens();
+        } else {
+            throw new Error(data.message || 'No se pudo suscribir el token');
         }
     } catch (error) {
-        console.error('Error al verificar nuevos pedidos (polling):', error);
+        console.error('Error suscribiendo token FCM:', error);
+        showNotificationPanel(`Error suscribiendo token: ${error.message}`, 'error');
     }
-}, 10000); // Cada 10 segundos
+}
 
-// Actualizar el saludo para incluir la hora actual
 function updateGreetingAndBackground() {
     const greetingElement = document.getElementById('dynamic-greeting');
     const now = new Date();
@@ -553,13 +1039,9 @@ function updateGreetingAndBackground() {
         backgroundClass = 'night';
     }
 
-    // Actualizar el mensaje de saludo
     greetingElement.textContent = greetingMessage;
-
-    // Cambiar la clase del banner para el fondo dinámico
-    greetingElement.className = `greeting ${backgroundClass}`;
+    greetingElement.className = `topbar-subtitle ${backgroundClass}`;
 }
 
-// Llamar a la función al cargar la página y actualizar cada minuto
 updateGreetingAndBackground();
 setInterval(updateGreetingAndBackground, 60000);
