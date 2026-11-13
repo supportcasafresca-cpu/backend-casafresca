@@ -1208,11 +1208,12 @@ async function deleteSecondaryNode(refPath) {
     await secondaryRtdb.ref(refPath).remove();
 }
 
-function toBoolLoose(value) {
+function toBoolLoose(value, fallback = false) {
     if (typeof value === 'boolean') return value;
     if (typeof value === 'string') {
         return value.toLowerCase() === 'true' || value === '1';
     }
+    if (value === undefined || value === null) return fallback;
     return Boolean(value);
 }
 
@@ -1227,8 +1228,8 @@ function normalizeProductPayload(payload = {}) {
         : (payload.imagenes ? [payload.imagenes] : []);
 
     const disponible = payload.disponibilidad !== undefined
-        ? payload.disponibilidad !== false
-        : payload.activo !== false;
+        ? toBoolLoose(payload.disponibilidad)
+        : toBoolLoose(payload.activo, true);
 
     return {
         id: payload.id || crypto.randomUUID(),
@@ -1247,6 +1248,9 @@ function normalizeProductPayload(payload = {}) {
         activo: disponible,
         disponibilidad: disponible,
         mas_vendido: toBoolLoose(payload.mas_vendido),
+        nuevo: toBoolLoose(payload.nuevo),
+        created_at: payload.created_at || payload.fecha_creacion || nowInTimeZone('America/Havana'),
+        modified_at: nowInTimeZone('America/Havana'),
         fecha_creacion: payload.fecha_creacion || nowInTimeZone('America/Havana'),
         fecha_actualizacion: nowInTimeZone('America/Havana')
     };
@@ -1620,16 +1624,16 @@ function normalizePackPayload(payload = {}) {
         precio: Number(payload.precio ?? 0),
         categoria: payload.categoria || 'general',
         stock: Number(payload.stock ?? 0),
-        oferta: Boolean(payload.oferta),
+        oferta: toBoolLoose(payload.oferta),
         descuento: Number(payload.descuento ?? 0),
         imagenes,
         imagen: imagenes[0] || '',
         productos,
         caracteristicas,
-        activo: payload.activo !== false,
-        disponible: payload.disponible !== false,
-        top: Boolean(payload.top),
-        nuevo: Boolean(payload.nuevo),
+        activo: toBoolLoose(payload.activo, true),
+        disponible: toBoolLoose(payload.disponible, true),
+        top: toBoolLoose(payload.top),
+        nuevo: toBoolLoose(payload.nuevo),
         fecha_creacion: payload.fecha_creacion || nowInTimeZone('America/Havana'),
         fecha_actualizacion: nowInTimeZone('America/Havana')
     };

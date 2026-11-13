@@ -25,6 +25,12 @@ function requiredEnv(name) {
   return value;
 }
 
+function toBool(value, fallback = false) {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (typeof value === 'string') return value.toLowerCase() === 'true' || value === '1';
+  return value === true || value === 1;
+}
+
 function makePublicId(filename) {
   const name = path.parse(filename).name
     .normalize('NFKD')
@@ -38,8 +44,8 @@ function makePublicId(filename) {
 
 function normalizeProduct(product, imagePublicIds) {
   const disponible = product.disponibilidad !== undefined
-    ? product.disponibilidad !== false
-    : product.activo !== false;
+    ? toBool(product.disponibilidad)
+    : toBool(product.activo, true);
   const createdAt = product.fecha_creacion || product.created_at || null;
   const updatedAt = product.fecha_actualizacion || product.modified_at || createdAt;
   const price = Number(product.precio ?? 0);
@@ -66,16 +72,16 @@ function normalizeProduct(product, imagePublicIds) {
     cantidad_minima: Math.max(1, Math.floor(Number(product.cantidad_minima ?? 1)) || 1),
     plazo_reposicion_dias: Math.max(0, Math.floor(Number(product.plazo_reposicion_dias ?? 0)) || 0),
     stock_seguridad_dias: Math.max(0, Math.floor(Number(product.stock_seguridad_dias ?? 0)) || 0),
-    aplicar_stock: product.aplicar_stock === true,
-    oferta: product.oferta === true,
+    aplicar_stock: toBool(product.aplicar_stock),
+    oferta: toBool(product.oferta),
     descuento: discount,
     imagenes: (Array.isArray(product.imagenes) ? product.imagenes : [])
       .filter(Boolean)
       .map(filename => imagePublicIds.get(filename) || filename),
     activo: disponible,
     disponibilidad: disponible,
-    mas_vendido: product.mas_vendido === true,
-    nuevo: product.nuevo === true,
+    mas_vendido: toBool(product.mas_vendido),
+    nuevo: toBool(product.nuevo),
     fecha_creacion: createdAt,
     fecha_actualizacion: updatedAt,
     created_at: product.created_at || createdAt,
