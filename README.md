@@ -37,9 +37,11 @@ The current backend reads whole nodes and does not issue RTDB `orderByChild`/`or
 
 Uploads are signed by this server using `CLOUDINARY_API_KEY` and `CLOUDINARY_API_SECRET`, and are stored in the `products` and `packs` folders in Casa Fresca's own Cloudinary account. The browser never receives the API secret. An unsigned upload preset is not used by this signed-upload flow. Cloudinary configuration is optional at startup, but image upload, deletion, and usage reporting remain unavailable until its credentials are configured.
 
-## Catalog migration
+## Product migration
 
-The one-time importer reads the preserved catalog at `../Casa-Fresca/Json/products.json`, payment config at `../Casa-Fresca/Json/pay.json`, and images at `../Casa-Fresca/Img/products`. It defaults to a non-mutating preview. Review the report, configure the new service credentials locally, and pass `--apply` to upload referenced images and write the catalog/config to the new primary RTDB. Unreferenced image files are reported and left untouched. Re-running the importer uses deterministic Cloudinary public IDs and overwrites only the corresponding catalog nodes.
+From this directory, run `npm run migrate:products` for a non-mutating preview. By default, the importer reads environment variables from `backend-casafresca/.env`; pass `--env-file <path>` after the script name to use a different private env file. The importer reads `../Casa-Fresca/Json/products.json` and referenced images in `../Casa-Fresca/Img/products`. Review the product/image counts and any unreferenced files before applying.
+
+To apply, configure the private `.env` with the primary `FIREBASE_SERVICE_ACCOUNT`, `FIREBASE_DATABASE_URL`, and Casa Fresca Cloudinary credentials, then run `npm run migrate:products -- --apply`. If your private variables file is stored elsewhere, pass its path, for example `npm run migrate:products -- --env-file ..\\Variables.env --apply`. Never commit private env files. The script uploads referenced images into Cloudinary's `products` folder and writes records keyed by product ID to the primary Realtime Database node `/products`. It normalizes catalog fields expected by the API, preserves legacy storefront fields such as `nuevo`, `created_at`, and `modified_at`, and adds the backend's stock/configuration defaults. It updates only matching product IDs and leaves other existing products and database nodes untouched. Re-running it uses deterministic Cloudinary public IDs and updates the corresponding product records.
 
 The old local statistics/comparison JSON files are retained as backups. Historical orders stored outside this workspace (for example in Apps Script/Sheets) must be exported separately before any import; this script does not read or delete them.
 
