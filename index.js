@@ -795,7 +795,7 @@ async function writeSecondaryNode(refPath, payload) {
 }
 
 // -----------------------------------------------------------------------------
-// Nueva arquitectura de ramas en la RTDB secundaria (datos-buquenque):
+// Estructura de ramas en la RTDB secundaria de Casa Fresca:
 //   /estadisticas      -> SOLO stats de visitas (sin "compras" ni datos de
 //                          comprador/envío, que en una visita sin compra
 //                          siempre llegan vacíos)
@@ -1794,7 +1794,7 @@ if (!SESSION_SECRET) {
 
 app.use(session({
     secret: SESSION_SECRET,
-    name: 'buquenque.sid',
+    name: 'casafresca.sid',
     resave: false,
     saveUninitialized: false,
     cookie: {
@@ -2027,7 +2027,7 @@ app.post('/api/auth/logout', (req, res) => {
     revokeAuthToken(req);
     if (req.session) {
         req.session.destroy(() => {
-            res.clearCookie('buquenque.sid');
+            res.clearCookie('casafresca.sid');
             return res.json({ success: true });
         });
     } else {
@@ -2360,7 +2360,10 @@ function _escapeHtml(unsafe) {
 
 app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
     try {
-        const nuevaEstadistica = req.body || {};
+        const nuevaEstadistica = {
+            ...(req.body || {}),
+            ip: _getRemoteIp(req)
+        };
         addLog(`Recibida nueva estadística: ${JSON.stringify(nuevaEstadistica)}`);
 
         if (!nuevaEstadistica.ip || !nuevaEstadistica.pais || !nuevaEstadistica.origen) {
@@ -2602,6 +2605,7 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
         console.error('Error: Datos de pedido vacíos.');
         return res.status(400).json({ success: false, message: 'Datos de pedido no proporcionados.' });
     }
+    orderData.ip = _getRemoteIp(req);
 
     let numeroOrdenResuelto = orderData.orderNumber || orderData.numero_orden || null;
 

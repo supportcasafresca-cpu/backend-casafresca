@@ -1,5 +1,5 @@
 (function () {
-    const TOKEN_KEY = 'buquenque_auth_token';
+    const TOKEN_KEY = 'casafresca_auth_token';
     const originalFetch = window.fetch.bind(window);
     window.fetch = function (input, init) {
         const opts = init ? Object.assign({}, init) : {};
@@ -9,7 +9,7 @@
         }
         return originalFetch(input, opts);
     };
-    window.buquenqueAuth = {
+    window.casaFrescaAuth = {
         setToken(token) { localStorage.setItem(TOKEN_KEY, token); },
         clearToken() { localStorage.removeItem(TOKEN_KEY); }
     };
@@ -780,7 +780,7 @@ document.addEventListener('DOMContentLoaded', () => {
             try {
                 await fetch('/api/auth/logout', { method: 'POST' });
             } finally {
-                window.buquenqueAuth.clearToken();
+                window.casaFrescaAuth.clearToken();
                 window.location.href = '/login';
             }
         });
