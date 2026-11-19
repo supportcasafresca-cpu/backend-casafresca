@@ -3311,12 +3311,10 @@ app.get('/api/evento', async (req, res) => {
 
 app.get('/api/info', async (req, res) => {
     try {
-        const info = await getOrSetCache('info', CACHE_TTL.PUBLIC_DATA, async () => {
-            const snapshot = await rtdb.ref('info').once('value');
-            const data = snapshot.val();
-            return Array.isArray(data) ? data : (data ? Object.values(data) : []);
-        });
-        setPublicCacheHeaders(res, 120, 600);
+        const snapshot = await rtdb.ref('info').once('value');
+        const data = snapshot.val();
+        const info = Array.isArray(data) ? data : (data ? Object.values(data) : []);
+        res.set('Cache-Control', 'no-store');
         return res.json({ success: true, info });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener info', error: error.message });
